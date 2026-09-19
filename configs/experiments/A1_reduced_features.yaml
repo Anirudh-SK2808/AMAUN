@@ -1,0 +1,18 @@
+# Ablation A1 -- Does heterogeneous evidence help? Semantic features only.
+# See docs/experiment_matrix.md for the observable this toggle MUST change;
+# tests/test_ablation_toggles.py asserts it is not a silent no-op.
+includes: [experiments/base.yaml]
+experiment_id: A1_reduced_features
+curriculum:
+  repository_init: bootstrap_six
+  seed_tasks: [sum, qa, instr, dialog, longform, domain]
+  evaluated_stream: [sum, qa, instr, dialog, longform, domain]
+features:
+  families:
+    semantic: true
+    parameter: false
+    gradient: false
+    performance: false
+    continual: false
+    historical: false
+    resource: false

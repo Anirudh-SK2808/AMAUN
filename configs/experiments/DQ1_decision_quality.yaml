@@ -1,0 +1,15 @@
+# DQ1 -- decision quality against a populated repository (docs/experiment_matrix.md).
+# This is the ONLY arm that measures the decision DIRECTLY (a confusion matrix over
+# {REUSE, FUSE, CREATE}) rather than through downstream score.
+#
+# BLOCKED: it requires overlap tasks T7..T10 that plausibly match an existing adapter.
+# With six maximally distinct task types, CREATE is a priori always correct and the decision
+# module is barely exercised (assumption A-14, docs/decision_register.md D-002).
+# evaluated_stream is deliberately left null so the runner refuses rather than producing a
+# result that looks like decision-quality evidence but is not.
+includes: [experiments/base.yaml]
+experiment_id: DQ1_decision_quality
+curriculum:
+  repository_init: bootstrap_six
+  seed_tasks: [sum, qa, instr, dialog, longform, domain]
+  evaluated_stream: null          # REQUIRES D-002 + D-006 sign-off and pinned overlap tasks

@@ -1,0 +1,13 @@
+# B6 -- repository compression by age/usage heuristic instead of utility.
+# The H5 comparison. idea.md S16.7 forbids this mechanism for AMAUN itself, so it exists
+# only here, named as a baseline.
+includes: [experiments/base.yaml]
+experiment_id: B6_heuristic_compression
+curriculum:
+  repository_init: bootstrap_six
+  seed_tasks: [sum, qa, instr, dialog, longform, domain]
+  evaluated_stream: [sum, qa, instr, dialog, longform, domain]
+repository:
+  max_bytes: 1000000              # TO BE SET to the same R_max as the compared AMAUN arm
+  compression:
+    mechanism: heuristic          # the ONLY difference from the main arm

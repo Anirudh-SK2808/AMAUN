@@ -1,0 +1,20 @@
+# AMAUN pinned environment.
+# Recorded in provenance.json on every run; these are the versions this codebase was
+# developed and tested against (Python 3.11.15, macOS arm64).
+#
+# QLoRA (`actual` tier) additionally needs bitsandbytes, which requires CUDA and therefore
+# cannot be installed usefully on Apple Silicon -- see docs/decision_register.md D-008.
+
+torch==2.14.0
+transformers==5.17.0
+peft==0.21.0
+datasets==4.5.1
+numpy==2.4.6
+pyyaml==6.0.3
+safetensors==0.7.0
+accelerate==1.13.1
+scipy==1.16.3
+pytest==9.1.1
+
+# CUDA hosts only (uncomment there):
+# bitsandbytes>=0.43

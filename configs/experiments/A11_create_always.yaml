@@ -1,0 +1,11 @@
+# Ablation A11 -- The no-management control: one adapter per task.
+# See docs/experiment_matrix.md for the observable this toggle MUST change;
+# tests/test_ablation_toggles.py asserts it is not a silent no-op.
+includes: [experiments/base.yaml]
+experiment_id: A11_create_always
+curriculum:
+  repository_init: bootstrap_six
+  seed_tasks: [sum, qa, instr, dialog, longform, domain]
+  evaluated_stream: [sum, qa, instr, dialog, longform, domain]
+manager:
+  allowed_outcomes: [CREATE]

@@ -1,0 +1,17 @@
+# B1 -- sequential FULL fine-tuning (brief S14 item 1).
+# This is the ONE arm where the frozen-backbone invariant is intentionally suspended.
+# The suspension is declared here, in config, so it is visible in config_used.json and can
+# never happen by accident in another arm.
+includes: [experiments/base.yaml]
+experiment_id: B1_sequential_full_ft
+curriculum:
+  repository_init: empty_sequential
+  seed_tasks: []
+  evaluated_stream: [sum, qa, instr, dialog, longform, domain]
+model:
+  backbone_trainable: true        # REQUIRED for B1 and rejected everywhere else
+experiment:
+  allow_unequal_budget: true
+  unequal_budget_reason: >-
+    'B1 updates all backbone parameters, so optimizer-step counts are not comparable with
+    LoRA arms by construction. Parameter counts and wall time are reported instead.'

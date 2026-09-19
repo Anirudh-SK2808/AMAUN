@@ -1,0 +1,14 @@
+# Main AMAUN arm: repository_init=bootstrap_six. See docs/decision_register.md D-002.
+includes:
+  - experiments/base.yaml
+
+experiment_id: main_bootstrap
+
+curriculum:
+  repository_init: bootstrap_six
+  seed_tasks: [sum, qa, instr, dialog, longform, domain]
+  # The evaluated stream must contain tasks NOT already in the repository, or REUSE/FUSE can
+  # never be the correct decision (docs/experiment_protocol.md S3, assumption A-14).
+  # Pending D-002/D-006 sign-off these are the six curriculum tasks re-arriving, which is a
+  # WIRING placeholder, not a valid scientific configuration -- the runner warns loudly.
+  evaluated_stream: [sum, qa, instr, dialog, longform, domain]

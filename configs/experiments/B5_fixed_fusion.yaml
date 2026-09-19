@@ -1,0 +1,11 @@
+# B5 -- fusion with fixed, non-learnable coefficients (idea.md S12.4 'Fixed fusion').
+# Identical to AMAUN except alpha never moves, isolating H2.
+includes: [experiments/base.yaml]
+experiment_id: B5_fixed_fusion
+curriculum:
+  repository_init: bootstrap_six
+  seed_tasks: [sum, qa, instr, dialog, longform, domain]
+  evaluated_stream: [sum, qa, instr, dialog, longform, domain]
+fusion:
+  coefficient:
+    learning_rate: 0.0            # the ONLY difference from the main arm

@@ -1,0 +1,79 @@
+# Task representation, feature extraction, utility network, and decision thresholds.
+task_repr:
+  encoder: backbone_mean_hidden   # backbone_mean_hidden | sentence_encoder | token_stats | hybrid
+  max_support_examples: 32        # manager reads SUPPORT only
+  pooling: mean                   # mean | last
+  normalise: true
+
+features:
+  # Each family is independently toggleable so ablations A1/A6/A7/A12 are config-only.
+  families:
+    semantic: true
+    parameter: true
+    gradient: true
+    performance: true
+    continual: true
+    historical: true
+    resource: true
+  semantic:
+    hidden_probe_examples: 16
+    include_cosine_as_feature: true   # allowed as ONE feature; never the rule (idea.md S16.2)
+  parameter:
+    aggregation: mean_std           # mean | max | mean_std | per_layer
+    rank_tolerance: 1.0e-5
+    max_layers_for_svd: 32          # bounds cost of singular-value features at 7B
+  gradient:
+    reference_batch_size: 8         # the FIXED reference minibatch protocol (idea.md S4.3)
+    reference_seed: 99
+  performance:
+    ece_bins: 10
+    max_eval_examples: 32
+  continual:
+    rho: 0.5                        # stability-plasticity weight S_i = 1 - F_i + rho*P_i
+  resource:
+    latency_probe_batches: 2
+  missing_value_sentinel: 0.0       # substituted for unknown features AND counted in the log
+
+utility:
+  network:
+    hidden_dims: [64, 64]           # TO BE TUNED
+    activation: relu
+    dropout: 0.1
+    output_heads: [primary_score, forgetting, confidence, memory, communication, long_term_loss]
+    # psi orients every head so larger = better; w is softplus-parameterised so utility is
+    # monotone non-decreasing in each oriented outcome (invariant I7.4).
+    monotone_weights: true
+  training:
+    learning_rate: 1.0e-3
+    epochs: 200
+    batch_size: 32
+    weight_decay: 1.0e-4
+    loss: l2                        # idea.md S9: L_U = sum ||g_w(z) - y||^2
+  supervision:
+    # D-010: actually performing every candidate merge is O(n^2) full fusion runs at 7B.
+    max_pairs_per_event: 8
+    pair_sampling: stratified_by_feature   # all | random | stratified_by_feature
+    proxy_steps: 20                 # truncated fusion+KD run used as a cheap target
+    proxy_validation_frac: 0.25     # fraction also run to convergence, to MEASURE proxy bias
+  normalisation:
+    fit_split: utility_train        # never test (invariant I6.2)
+    epsilon: 1.0e-8
+
+manager:
+  decision_order: prescreen_then_train   # prescreen_then_train | train_then_decide (D-003)
+  retrieval:
+    mode: top_k                     # single | top_k
+    k: 3
+  threshold:
+    selection: dev_stream           # dev_stream | historical_cv | fixed (D-005)
+    tau_u: null                     # null => selected by the declared procedure, then logged
+    tau_reuse: null
+    fixed_tau_u: 0.5                # used only when selection == fixed
+    fixed_tau_reuse: 0.7
+  allowed_outcomes: [REUSE, FUSE, CREATE]
+
+repository:
+  max_bytes: null                   # R_max. null => no compression trigger (ablation A5)
+  min_adapters: 2                   # compression floor, prevents collapse to a single adapter
+  compression:
+    mechanism: utility              # utility | heuristic. 'heuristic' is ONLY for baseline B6.

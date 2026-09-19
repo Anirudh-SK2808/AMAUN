@@ -1,0 +1,14 @@
+# Ablation A2 -- Does the LEARNED utility help versus a fixed rule over the same features?
+# See docs/experiment_matrix.md for the observable this toggle MUST change;
+# tests/test_ablation_toggles.py asserts it is not a silent no-op.
+includes: [experiments/base.yaml]
+experiment_id: A2_fixed_rule
+curriculum:
+  repository_init: bootstrap_six
+  seed_tasks: [sum, qa, instr, dialog, longform, domain]
+  evaluated_stream: [sum, qa, instr, dialog, longform, domain]
+manager:
+  similarity:
+    feature: semantic.d_task_sq
+    threshold: 0.0
+    higher_is_more_similar: false

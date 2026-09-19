@@ -1,0 +1,65 @@
+# Shared experiment settings. Concrete arms include this file.
+includes:
+  - model/qwen.yaml
+  - training/default.yaml
+  - datasets/curriculum.yaml
+  - fusion/learnable_layerwise.yaml
+  - utility/default.yaml
+  - federated/default.yaml
+
+evaluation:
+  max_test_examples: 8          # cap for smoke/dummy; raise for `actual`
+  # Forward transfer needs S[j-1][j]: the score on task j BEFORE learning it. Enabling this
+  # lets the EVALUATOR read a future task's TEST split for reporting only; the manager never
+  # sees those scores (docs/system_specification.md M10, invariant I10.2).
+  evaluate_unseen_for_fwt: true
+
+experiment:
+  seeds: [1234]               # D-012 requires >=3 seeds for any REPORTED run
+  budget_tolerance: 0.05      # relative budget divergence allowed between compared arms
+  allow_unequal_budget: false
+  allow_dirty_git: false      # gated for `actual` runs
+  evaluate_every_task: true
+
+curriculum:
+  repository_init: null       # bootstrap_six | empty_sequential -- NO DEFAULT (D-002 OPEN)
+  evaluated_stream: null      # list of task ids forming the arriving-task stream
+  seed_tasks: null            # tasks used to bootstrap the repository (bootstrap_six only)
+
+# Per-run-mode overlays keep values visible in config_used.json rather than hidden in code.
+run_mode_overrides:
+  dummy:
+    data:
+      provider: synthetic
+      synthetic_pool_size: 64
+      synthetic_test_size: 16
+      smoke_max_examples_per_split: 8
+    training:
+      max_steps: 2
+      batch_size: 2
+      gradient_accumulation_steps: 1
+      eval_every_steps: null
+      log_every_steps: 1
+    fusion:
+      steps: 2
+    utility:
+      training:
+        epochs: 5
+      supervision:
+        max_pairs_per_event: 2
+        proxy_steps: 2
+    features:
+      semantic:
+        hidden_probe_examples: 4
+      gradient:
+        reference_batch_size: 2
+      performance:
+        max_eval_examples: 4
+  local_smoke:
+    data:
+      provider: synthetic     # switch to huggingface once D-006 B1/B2 are resolved
+      smoke_max_examples_per_split: 32
+    training:
+      max_steps: 10
+    fusion:
+      steps: 5

@@ -1,0 +1,143 @@
+# Task curriculum -- idea.md S0.2, implemented as an extensible config-driven list.
+# Adding a task requires no code change (idea.md S0.2 note 4).
+#
+# LICENSING AND PINNING: see docs/decision_register.md D-006.
+# Two rows are deliberately unpinned; the loader raises UnpinnedDatasetError rather than
+# guessing, because the choice changes what the adapter represents.
+
+data:
+  provider: synthetic        # huggingface | synthetic. synthetic is offline, for tests/dummy.
+  cache_dir: data/raw
+  seed: 1234
+  split_ratios:              # fractions of the TRAINING POOL; TEST comes from a separate source
+    train: 0.70
+    validation: 0.15
+    support: 0.15
+  smoke_max_examples_per_split: 32   # idea.md S0.2.1: defined ONCE, referenced everywhere
+  synthetic_pool_size: 256
+  synthetic_test_size: 64
+
+datasets:
+  order: [sum, qa, instr, dialog, longform, domain]
+
+  tasks:
+    sum:
+      task_name: Summarization
+      task_type: summarization
+      description: "Abstractive news summarization (idea.md S0.2 LoRA-1)."
+      hf_id: abisee/cnn_dailymail
+      hf_revision: "3.0.0"
+      hf_config: "3.0.0"
+      license: "Apache-2.0 (dataset scripts); news articles under fair-use research terms"
+      license_notes: "Re-verify at download time. Redistribution of article text is restricted."
+      primary_score: rougeL
+      metrics: [rouge1, rouge2, rougeL]
+      input_fields: [article]
+      target_field: highlights
+      prompt_template: "Summarize the following news article.\n\nArticle:\n{article}\n\nSummary:"
+      max_input_tokens: 768
+      max_target_tokens: 128
+      upstream_test_source: "upstream 'validation' split (upstream 'test' reserved, unused)"
+      actual_volume_note: "30k-50k train per idea.md S0.2; exact value recorded in config_used.json"
+
+    qa:
+      task_name: Question Answering
+      task_type: question_answering
+      description: "Extractive QA (idea.md S0.2 LoRA-2)."
+      hf_id: rajpurkar/squad
+      hf_revision: null
+      hf_config: plain_text
+      license: "CC BY-SA 4.0"
+      license_notes: "Share-alike applies to derivatives."
+      primary_score: token_f1
+      metrics: [exact_match, token_f1]
+      input_fields: [context, question]
+      target_field: answers
+      prompt_template: "Answer the question using only the context.\n\nContext:\n{context}\n\nQuestion: {question}\n\nAnswer:"
+      max_input_tokens: 512
+      max_target_tokens: 48
+      upstream_test_source: "upstream 'validation' split (SQuAD test labels are not public)"
+
+    instr:
+      task_name: Instruction Following
+      task_type: instruction_following
+      description: "FLAN-style instruction following (idea.md S0.2 LoRA-3)."
+      hf_id: null              # BLOCKER D-006 B1
+      hf_revision: null
+      hf_config: null
+      pinned: false
+      unpinned_reason: >-
+        '"FLAN-style" is not a dataset. Candidates differ substantially in mixture
+        composition, which changes what this adapter is. Candidates: Muennighoff/flan,
+        SirNeural/flan_v2, databricks/databricks-dolly-15k (CC BY-SA 3.0).
+        See docs/decision_register.md D-006 B1.'
+      license: UNPINNED
+      license_notes: "Depends on the chosen mixture."
+      primary_score: rougeL
+      metrics: [rougeL, bertscore_f1]
+      input_fields: [instruction, input]
+      target_field: output
+      prompt_template: "{instruction}\n\n{input}\n\nResponse:"
+      max_input_tokens: 512
+      max_target_tokens: 256
+      upstream_test_source: UNPINNED
+
+    dialog:
+      task_name: Dialogue Generation
+      task_type: dialogue
+      description: "Open-domain multi-turn dialogue (idea.md S0.2 LoRA-4)."
+      hf_id: li2017dailydialog/daily_dialog
+      hf_revision: null
+      hf_config: null
+      license: "CC BY-NC-SA 4.0"
+      license_notes: "NON-COMMERCIAL only. Research use is permitted; must be stated in any release."
+      primary_score: rougeL
+      metrics: [rougeL, distinct_2]
+      input_fields: [history]
+      target_field: response
+      prompt_template: "Continue the conversation naturally.\n\n{history}\n\nResponse:"
+      max_input_tokens: 512
+      max_target_tokens: 128
+      upstream_test_source: "upstream 'validation' split"
+
+    longform:
+      task_name: Long-form Generation
+      task_type: long_form_generation
+      description: "Long-form explanatory answers (idea.md S0.2 LoRA-5)."
+      hf_id: null              # BLOCKER D-006 B2
+      hf_revision: null
+      hf_config: null
+      pinned: false
+      unpinned_reason: >-
+        'The original ELI5 HF dataset was withdrawn over Reddit API/licensing terms and is
+        not reliably loadable. Candidates: eli5_category, KILT-ELI5, or a different long-form
+        corpus -- but substituting changes what "long-form generation" means in the paper.
+        See docs/decision_register.md D-006 B2.'
+      license: UNPINNED
+      license_notes: "Reddit-derived content has redistribution restrictions."
+      primary_score: rougeL
+      metrics: [rougeL, perplexity]
+      input_fields: [question]
+      target_field: answer
+      prompt_template: "Explain in detail.\n\nQuestion: {question}\n\nExplanation:"
+      max_input_tokens: 256
+      max_target_tokens: 512
+      upstream_test_source: UNPINNED
+
+    domain:
+      task_name: Domain-specific Generation
+      task_type: domain_generation
+      description: "Financial reasoning/generation (idea.md S0.2 LoRA-6)."
+      hf_id: dreamerdeo/finqa
+      hf_revision: null
+      hf_config: null
+      license: "MIT (per source repository)"
+      license_notes: "Re-verify at download time."
+      primary_score: token_f1
+      metrics: [exact_match, token_f1, rougeL]
+      input_fields: [context, question]
+      target_field: answer
+      prompt_template: "You are a financial analyst. Use the context to answer.\n\nContext:\n{context}\n\nQuestion: {question}\n\nAnswer:"
+      max_input_tokens: 768
+      max_target_tokens: 128
+      upstream_test_source: "upstream 'test' split"

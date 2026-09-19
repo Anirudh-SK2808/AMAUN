@@ -1,0 +1,13 @@
+# B2 -- one LoRA adapter per task, never merged (brief S14 item 2).
+# The growth reference for H3: if AMAUN does not store fewer adapters than this, the
+# growth-control claim fails.
+includes: [experiments/base.yaml]
+experiment_id: B2_separate_lora
+curriculum:
+  repository_init: empty_sequential
+  seed_tasks: []
+  evaluated_stream: [sum, qa, instr, dialog, longform, domain]
+manager:
+  allowed_outcomes: [CREATE]
+repository:
+  max_bytes: null                 # no compression: unbounded growth is the point

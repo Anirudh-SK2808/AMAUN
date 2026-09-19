@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amaun"
+version = "0.1.0"
+description = "AMAUN - Adaptive Multi-criteria Adapter Utility Network: federated continual learning for SLMs with dynamic LoRA adapter management"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "See LICENSE" }
+
+# Pinned in requirements.txt; ranges here keep the package installable.
+dependencies = [
+  "torch>=2.2",
+  "transformers>=4.40",
+  "peft>=0.10",
+  "datasets>=2.18",
+  "numpy>=1.26",
+  "pyyaml>=6.0",
+  "safetensors>=0.4",
+  "accelerate>=0.29",
+  "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+# CUDA only: bitsandbytes has no MPS backend, so QLoRA cannot run on Apple Silicon (D-008).
+quantization = ["bitsandbytes>=0.43"]
+dev = ["pytest>=8.0", "pytest-randomly>=3.15"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+addopts = "-q --strict-markers"
+filterwarnings = [
+  "ignore::UserWarning:torch.*",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

@@ -1,0 +1,18 @@
+# B3 -- uniform-coefficient delta averaging (brief S14 item 3).
+# Averaging is still at the effective-delta level; A/B factor averaging is forbidden
+# everywhere (idea.md S16.3), baselines included.
+includes: [experiments/base.yaml]
+experiment_id: B3_naive_average
+curriculum:
+  repository_init: bootstrap_six
+  seed_tasks: [sum, qa, instr, dialog, longform, domain]
+  evaluated_stream: [sum, qa, instr, dialog, longform, domain]
+manager:
+  allowed_outcomes: [FUSE]
+fusion:
+  coefficient:
+    learning_rate: 0.0            # coefficients are fixed at 1/m and never learned
+  train_lora_params: false
+kd:
+  enabled: false
+  lambda: 0.0

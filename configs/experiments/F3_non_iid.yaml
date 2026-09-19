@@ -1,0 +1,23 @@
+# Federated arm F3 -- Realistic FCL: clients hold different task subsets.
+# TASK, CLIENT, ADAPTER and ROUND are independent axes (docs/decision_register.md D-011).
+includes: [experiments/base.yaml]
+experiment_id: F3_non_iid
+curriculum:
+  repository_init: bootstrap_six
+  seed_tasks: [sum, qa, instr, dialog, longform, domain]
+  evaluated_stream: [sum, qa, instr, dialog, longform, domain]
+federated:
+  enabled: true
+  partition: disjoint_task_subsets
+  dirichlet_alpha: 0.5
+  num_clients: 4
+  round_every: 2
+  participation_rate: 1.0
+  compatibility:
+    key: task_id
+    require_same_rank: true
+    require_same_target_modules: true
+    require_same_backbone: true
+  aggregation:
+    method: delta_fedavg
+    weight_by: example_count

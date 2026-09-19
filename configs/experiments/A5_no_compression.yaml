@@ -1,0 +1,11 @@
+# Ablation A5 -- What does unmanaged adapter growth cost?
+# See docs/experiment_matrix.md for the observable this toggle MUST change;
+# tests/test_ablation_toggles.py asserts it is not a silent no-op.
+includes: [experiments/base.yaml]
+experiment_id: A5_no_compression
+curriculum:
+  repository_init: bootstrap_six
+  seed_tasks: [sum, qa, instr, dialog, longform, domain]
+  evaluated_stream: [sum, qa, instr, dialog, longform, domain]
+repository:
+  max_bytes: null

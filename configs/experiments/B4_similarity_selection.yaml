@@ -1,0 +1,15 @@
+# B4 -- single-metric similarity selection (brief S14 item 4 / idea.md S12.4).
+# The direct H1 comparison. It receives the SAME feature extraction pipeline as AMAUN so it
+# is not handicapped by worse inputs; the difference is that its RULE reads one feature.
+includes: [experiments/base.yaml]
+experiment_id: B4_similarity_selection
+curriculum:
+  repository_init: bootstrap_six
+  seed_tasks: [sum, qa, instr, dialog, longform, domain]
+  evaluated_stream: [sum, qa, instr, dialog, longform, domain]
+manager:
+  allowed_outcomes: [FUSE, CREATE]
+  similarity:
+    feature: semantic.d_task_sq   # Euclidean task distance: the natural single metric
+    threshold: 0.0                # TO BE TUNED on validation, exactly as tau_u is
+    higher_is_more_similar: false

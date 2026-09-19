@@ -1,0 +1,19 @@
+# Federated configuration -- idea.md S7.3.
+# TASK, CLIENT, ADAPTER and ROUND are independent axes; one client != one task (D-011).
+federated:
+  enabled: false
+  num_clients: 4
+  partition: iid_shards       # iid_shards | disjoint_task_subsets | dirichlet
+  dirichlet_alpha: 0.5
+  round_every: 2              # aggregate every N task arrivals
+  participation_rate: 1.0
+  local_epochs: 1
+  compatibility:
+    key: task_id              # task_id | adapter_lineage | utility_cluster
+    require_same_rank: true
+    require_same_target_modules: true
+    require_same_backbone: true
+  aggregation:
+    method: delta_fedavg      # delta_fedavg | svd_refactor_fedavg | component_concat
+    # NEVER average A/B factors independently (idea.md S16.3) -- no such option exists.
+    weight_by: example_count  # n_c / sum_j n_j

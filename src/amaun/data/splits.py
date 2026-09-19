@@ -1,0 +1,255 @@
+"""M2 -- deterministic four-way splits with structural leakage prevention.
+
+Master-prompt S6 and brief S5 require four disjoint splits per task, with SUPPORT being the
+*only* thing the manager may see and TEST touched once, by the evaluator.
+
+The split function has two properties that matter more than they look:
+
+1. **Assignment is a pure function of content**, not of row index:
+   ``bucket = sha256(task_id | example_hash | seed) mod N``.  Row-index splitting breaks
+   silently if the upstream dataset is ever reshuffled or re-versioned, which would
+   reassign examples between SUPPORT and TEST across runs -- a leak that no test on a single
+   run could detect.
+
+2. **SUPPORT is carved from the training pool.**  It is never drawn from whatever upstream
+   split becomes our TEST, so "the manager saw SUPPORT" can never mean "the manager saw
+   TEST" (assumption A-05).
+"""
+
+from __future__ import annotations
+
+import enum
+import hashlib
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Mapping, Sequence
+
+from amaun.errors import DataError, LeakageError, SplitAccessViolation
+
+
+class SplitName(str, enum.Enum):
+    TRAIN = "train"
+    VALIDATION = "validation"
+    SUPPORT = "support"
+    TEST = "test"
+
+
+# Resolution of the hash bucketing.  Higher = finer-grained ratio control.
+_BUCKETS = 10_000
+
+
+@dataclass
+class Example:
+    """One preprocessed example.  ``example_id`` is a content hash, hence split-stable."""
+
+    prompt: str
+    target: str
+    task_id: str
+    meta: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def example_id(self) -> str:
+        digest = hashlib.sha256()
+        digest.update(self.task_id.encode())
+        digest.update(b"\x00")
+        digest.update(self.prompt.encode())
+        digest.update(b"\x00")
+        digest.update(self.target.encode())
+        return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class SplitRatios:
+    """Fractions of the *training pool* assigned to train/validation/support.
+
+    TEST is not a fraction of the training pool: it comes from a separate upstream source
+    (documented per task in ``TaskSpec.upstream_test_source``), which is what keeps it
+    genuinely held out rather than merely partitioned.
+    """
+
+    train: float
+    validation: float
+    support: float
+
+    @classmethod
+    def from_config(cls, section: Mapping[str, Any]) -> "SplitRatios":
+        missing = [k for k in ("train", "validation", "support") if k not in section]
+        if missing:
+            raise DataError(f"data.split_ratios missing keys: {missing}")
+        ratios = cls(
+            train=float(section["train"]),
+            validation=float(section["validation"]),
+            support=float(section["support"]),
+        )
+        total = ratios.train + ratios.validation + ratios.support
+        if abs(total - 1.0) > 1e-6:
+            raise DataError(
+                f"split_ratios over the training pool must sum to 1.0, got {total:.6f} "
+                f"(TEST comes from a separate upstream source, not from this pool)"
+            )
+        return ratios
+
+
+def _bucket(task_id: str, example_id: str, seed: int) -> int:
+    digest = hashlib.sha256(f"{task_id}|{example_id}|{seed}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") % _BUCKETS
+
+
+def assign_split(example: Example, *, seed: int, ratios: SplitRatios) -> SplitName:
+    """Assign one training-pool example to TRAIN, VALIDATION, or SUPPORT."""
+    bucket = _bucket(example.task_id, example.example_id, seed)
+    train_cut = int(round(ratios.train * _BUCKETS))
+    val_cut = train_cut + int(round(ratios.validation * _BUCKETS))
+    if bucket < train_cut:
+        return SplitName.TRAIN
+    if bucket < val_cut:
+        return SplitName.VALIDATION
+    return SplitName.SUPPORT
+
+
+@dataclass
+class TaskSplits:
+    """The four splits for one task, plus the provenance of how they were made."""
+
+    task_id: str
+    splits: dict[SplitName, list[Example]]
+    seed: int
+    ratios: SplitRatios
+    provenance: dict[str, Any] = field(default_factory=dict)
+
+    def __getitem__(self, name: SplitName | str) -> list[Example]:
+        return self.splits[SplitName(name)]
+
+    def counts(self) -> dict[str, int]:
+        return {name.value: len(examples) for name, examples in self.splits.items()}
+
+    def hashes(self, name: SplitName) -> set[str]:
+        return {example.example_id for example in self.splits[SplitName(name)]}
+
+    def assert_disjoint(self) -> None:
+        """Invariant I2.1: verify pairwise disjointness by content hash, not by construction.
+
+        Verifying the *result* rather than trusting the split function is the point: a future
+        change to preprocessing, deduplication, or upstream source could introduce overlap
+        that the partition logic itself would never reveal.
+        """
+        names = list(self.splits)
+        for i, left in enumerate(names):
+            for right in names[i + 1 :]:
+                overlap = self.hashes(left) & self.hashes(right)
+                if overlap:
+                    raise LeakageError(
+                        f"task '{self.task_id}': splits {left.value} and {right.value} share "
+                        f"{len(overlap)} example(s). Example of a leaked id: {sorted(overlap)[0][:16]}"
+                    )
+
+    def subsample(self, max_per_split: int, *, seed: int) -> "TaskSplits":
+        """idea.md S0.2.1: uniform subsampling across *all four* splits, one config key.
+
+        Deterministic (sorted by example_id then sliced) so a smoke run is reproducible.
+        """
+        reduced = {}
+        for name, examples in self.splits.items():
+            ordered = sorted(examples, key=lambda e: _bucket(e.task_id, e.example_id, seed))
+            reduced[name] = ordered[:max_per_split]
+        return TaskSplits(
+            task_id=self.task_id,
+            splits=reduced,
+            seed=self.seed,
+            ratios=self.ratios,
+            provenance={**self.provenance, "subsampled_to": max_per_split},
+        )
+
+
+def build_splits(
+    task_id: str,
+    *,
+    training_pool: Sequence[Example],
+    test_pool: Sequence[Example],
+    seed: int,
+    ratios: SplitRatios,
+    provenance: dict[str, Any] | None = None,
+) -> TaskSplits:
+    """Partition a training pool three ways and attach a separately-sourced test pool."""
+    splits: dict[SplitName, list[Example]] = {name: [] for name in SplitName}
+    for example in training_pool:
+        splits[assign_split(example, seed=seed, ratios=ratios)].append(example)
+    splits[SplitName.TEST] = list(test_pool)
+
+    result = TaskSplits(
+        task_id=task_id,
+        splits=splits,
+        seed=seed,
+        ratios=ratios,
+        provenance={
+            "training_pool_size": len(training_pool),
+            "test_pool_size": len(test_pool),
+            "split_method": "sha256(task_id|content_hash|seed) mod 10000",
+            **(provenance or {}),
+        },
+    )
+    result.assert_disjoint()
+    return result
+
+
+class SplitAccessGuard:
+    """A typed capability: holds splits but yields only the permitted ones.
+
+    This is the mechanism behind invariant I2.4.  The manager is handed a guard permitting
+    ``{SUPPORT}``; the evaluator one permitting ``{TEST}``.  There is no code path by which
+    the manager holds a TEST iterator, so creating a leak requires editing the guard
+    construction -- a visible, reviewable act rather than an accident.
+    """
+
+    def __init__(
+        self,
+        splits: TaskSplits,
+        permitted: Iterable[SplitName],
+        *,
+        owner: str,
+    ) -> None:
+        self._splits = splits
+        self.permitted = frozenset(SplitName(p) for p in permitted)
+        self.owner = owner
+        self.access_log: list[str] = []
+
+    @property
+    def task_id(self) -> str:
+        return self._splits.task_id
+
+    def get(self, name: SplitName | str) -> list[Example]:
+        requested = SplitName(name)
+        if requested not in self.permitted:
+            raise SplitAccessViolation(
+                f"'{self.owner}' may read {sorted(p.value for p in self.permitted)} but "
+                f"requested '{requested.value}' for task '{self._splits.task_id}'. "
+                f"This would violate the split-isolation contract "
+                f"(docs/master_prompt.md S6)."
+            )
+        self.access_log.append(requested.value)
+        return self._splits[requested]
+
+    def counts(self) -> dict[str, int]:
+        """Sizes of permitted splits only (a size leak is still a leak)."""
+        return {n.value: len(self._splits[n]) for n in self.permitted}
+
+
+def manager_guard(splits: TaskSplits) -> SplitAccessGuard:
+    """The manager sees SUPPORT and nothing else (brief S5)."""
+    return SplitAccessGuard(splits, {SplitName.SUPPORT}, owner="manager")
+
+
+def trainer_guard(splits: TaskSplits) -> SplitAccessGuard:
+    """Adapter training sees TRAIN (and VALIDATION for early stopping)."""
+    return SplitAccessGuard(splits, {SplitName.TRAIN, SplitName.VALIDATION}, owner="trainer")
+
+
+def evaluator_guard(splits: TaskSplits) -> SplitAccessGuard:
+    """Only the evaluator sees TEST (invariant I12.1)."""
+    return SplitAccessGuard(splits, {SplitName.TEST}, owner="evaluator")
+
+
+def utility_guard(splits: TaskSplits) -> SplitAccessGuard:
+    """Utility-network supervision: everything except TEST (idea.md S9)."""
+    return SplitAccessGuard(
+        splits, {SplitName.TRAIN, SplitName.VALIDATION, SplitName.SUPPORT}, owner="utility"
+    )

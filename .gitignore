@@ -1,0 +1,25 @@
+# Virtual environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Raw and processed data are large and reconstructible from configs + revisions.
+data/raw/**
+data/processed/**
+data/splits/**
+!data/**/.gitkeep
+
+# Adapter weights and results are run artefacts, not source.
+adapters/**
+!adapters/.gitkeep
+results/**
+!results/.gitkeep
+
+# Keep the dummy tier out of version control entirely: it is a test fixture.
+results/dummy/**
+adapters/dummy/**
+
+.DS_Store

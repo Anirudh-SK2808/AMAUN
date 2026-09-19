@@ -1,0 +1,10 @@
+# Main AMAUN arm: repository_init=empty_sequential. See docs/decision_register.md D-002.
+includes:
+  - experiments/base.yaml
+
+experiment_id: main_sequential
+
+curriculum:
+  repository_init: empty_sequential
+  seed_tasks: []
+  evaluated_stream: [sum, qa, instr, dialog, longform, domain]

@@ -1,0 +1,24 @@
+# Layer-wise learnable fusion -- idea.md S6, generalised to top-k per D-004.
+fusion:
+  coefficient:
+    parameterisation: softmax_k   # softmax_k | sigmoid_pair (sigmoid_pair = exact idea.md S6.2)
+    granularity: layerwise        # layerwise | global  (global is ablation A8)
+    init_value: 0.5               # idea.md S6.1/S10: FIXED init, not tunable. m=2 => alpha=0.5.
+    learning_rate: 1.0e-2         # eta_alpha. TO BE TUNED on validation.
+  storage: refactorize_svd        # dense_delta | refactorize_svd | keep_components (D-013)
+  refactorize_rank: null          # null => source LoRA rank r
+  train_lora_params: true         # jointly optimise phi_merge with alpha (idea.md S6.5)
+  freeze_source_adapters: true    # invariant I8.4
+  steps: 100                      # post-merge optimisation steps. TO BE TUNED.
+  stopping:
+    criterion: fixed_steps        # fixed_steps | validation_plateau
+    patience: 3
+
+kd:
+  enabled: true
+  lambda: 1.0                     # KD weight. TO BE TUNED.
+  temperature: 2.0                # T. TO BE TUNED.
+  teacher: pre_merge_old_adapter  # idea.md S16.9 -- NOT the frozen backbone. Only valid value.
+  retention_examples: 64          # |D_rep| for the KD retention set
+  retention_source: [train, validation]   # never test
+  top_p_truncation: null          # null => full distribution; a value bounds teacher cache size (A-09)

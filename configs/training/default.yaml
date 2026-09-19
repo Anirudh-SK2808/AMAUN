@@ -1,0 +1,16 @@
+# Training hyperparameters. Every value is TO BE TUNED on VALIDATION (protocol S8);
+# these are starting points, not findings.
+training:
+  learning_rate: 2.0e-4
+  epochs: 1.0
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_steps: null            # null => derived from epochs
+  warmup_ratio: 0.03
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  scheduler: cosine
+  gradient_checkpointing: false
+  early_stopping_patience: 3
+  eval_every_steps: 50
+  log_every_steps: 10

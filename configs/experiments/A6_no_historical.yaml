@@ -1,0 +1,12 @@
+# Ablation A6 -- Does adapter history help long-term decisions?
+# See docs/experiment_matrix.md for the observable this toggle MUST change;
+# tests/test_ablation_toggles.py asserts it is not a silent no-op.
+includes: [experiments/base.yaml]
+experiment_id: A6_no_historical
+curriculum:
+  repository_init: bootstrap_six
+  seed_tasks: [sum, qa, instr, dialog, longform, domain]
+  evaluated_stream: [sum, qa, instr, dialog, longform, domain]
+features:
+  families:
+    historical: false
