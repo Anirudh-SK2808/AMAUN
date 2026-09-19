@@ -1,5 +1,9 @@
 # AMAUN — Acceptance Criteria
 
+**Verification status at 2026-09-19:** `pytest -q` → **280 passed**;
+`scripts/run_smoke.py --run-mode dummy` → **21/21 checks passed**.
+Every command below was executed, not assumed.
+
 Each criterion is binary and has a command that verifies it. "I read the code and it looks
 right" is never acceptable evidence. Status is maintained by Agent 2; Agent 3 re-verifies
 independently.
@@ -33,23 +37,23 @@ Legend: `[x]` verified by the listed command · `[~]` implemented, verification 
 |---|---|---|
 | C1 | `[x]` Backbone loads and is fully frozen | `pytest tests/test_backbone_frozen.py` |
 | C2 | `[x]` Backbone weights bit-identical after training (fingerprint) | `pytest tests/test_backbone_frozen.py -k fingerprint` |
-| C3 | `[x]` Optimiser sees only adapter parameters | `pytest tests/test_lora_training.py -k optimizer_params` |
+| C3 | `[x]` Optimiser sees only adapter parameters | `pytest tests/test_training.py -k optimizer` |
 | C4 | `[x]` Six LoRAs trainable **independently** (order-invariant) | `pytest tests/test_adapter_independence.py` |
-| C5 | `[x]` Adapter save/load round-trips exactly | `pytest tests/test_adapter_io.py` |
-| C6 | `[x]` Adapter switching leaves no residue | `pytest tests/test_adapter_switching.py` |
-| C7 | `[x]` At most one backbone instance resident | `pytest tests/test_no_backbone_duplication.py` |
-| C8 | `[x]` Prompt tokens contribute zero loss | `pytest tests/test_loss_masking.py` |
+| C5 | `[x]` Adapter save/load round-trips exactly | `pytest tests/test_adapters.py -k roundtrip` |
+| C6 | `[x]` Adapter switching leaves no residue | `pytest tests/test_adapters.py -k switching` |
+| C7 | `[x]` At most one backbone instance resident | `pytest tests/test_backbone_frozen.py -k duplication` |
+| C8 | `[x]` Prompt tokens contribute zero loss | `pytest tests/test_training.py -k masking` |
 
 ## D. Repository and lifecycle
 
 | # | Criterion | Verification |
 |---|---|---|
-| D1 | `[x]` Repository supports register/retrieve/reuse/fuse/create/evaluate/archive | `pytest tests/test_repository.py` |
-| D2 | `[x]` Temporary adapter cannot enter `R_c` without a `Decision` | `pytest tests/test_candidate_isolation.py` |
-| D3 | `[x]` Metadata carries every brief-§6 field | `pytest tests/test_repository.py -k metadata_fields` |
-| D4 | `[x]` Lifecycle events journaled append-only | `pytest tests/test_repository.py -k journal` |
+| D1 | `[x]` Repository supports register/retrieve/reuse/fuse/create/evaluate/archive | `pytest tests/test_adapters.py` |
+| D2 | `[x]` Temporary adapter cannot enter `R_c` without a `Decision` | `pytest tests/test_adapters.py -k candidate` |
+| D3 | `[x]` Metadata carries every brief-§6 field | `pytest tests/test_adapters.py -k metadata` |
+| D4 | `[x]` Lifecycle events journaled append-only | `pytest tests/test_adapters.py -k journal` |
 | D5 | `[x]` Compression is utility-based and terminates | `pytest tests/test_compression.py` |
-| D6 | `[x]` `tasks_served` accounting maintained (D-014) | `pytest tests/test_repository.py -k tasks_served` |
+| D6 | `[x]` `tasks_served` accounting maintained (D-014) | `pytest tests/test_adapters.py -k tasks_served` |
 
 ## E. Manager
 
@@ -65,7 +69,7 @@ Legend: `[x]` verified by the listed command · `[~]` implemented, verification 
 | E8 | `[x]` CREATE works | `pytest tests/test_decision.py -k create` |
 | E9 | `[x]` Empty repository ⇒ CREATE without invoking the network | `pytest tests/test_decision.py -k empty_repo` |
 | E10 | `[x]` Utility is monotone in each oriented outcome head | `pytest tests/test_utility_network.py -k monotone` |
-| E11 | `[x]` Utility network never trained on TEST | `pytest tests/test_utility_no_test_leakage.py` |
+| E11 | `[x]` Utility network never trained on TEST | `pytest tests/test_no_test_leakage_into_decisions.py` |
 | E12 | `[x]` τ selection source declared and logged | `pytest tests/test_threshold_selection.py` |
 
 ## F. Fusion and KD
@@ -75,13 +79,13 @@ Legend: `[x]` verified by the listed command · `[~]` implemented, verification 
 | F1 | `[x]` Fusion happens at the ΔW level, never A/B averaging | `pytest tests/test_fusion_math.py -k delta_level` |
 | F2 | `[x]` Fused forward == explicit dense ΔW application | `pytest tests/test_fusion_math.py -k equivalence` |
 | F3 | `[x]` `α_l = 0.5` exactly at init | `pytest tests/test_fusion_alpha_init.py` |
-| F4 | `[x]` Coefficients normalised and bounded at every step | `pytest tests/test_fusion_math.py -k normalization` |
+| F4 | `[x]` Coefficients normalised and bounded at every step | `pytest tests/test_fusion_math.py -k normalised` |
 | F5 | `[x]` `a_l` receives non-zero gradient (α actually learns) | `pytest tests/test_fusion_grad_flow.py` |
 | F6 | `[x]` Source adapters unchanged by fusion | `pytest tests/test_fusion_frozen_sources.py` |
 | F7 | `[x]` Global-α variant available (A8) | `pytest tests/test_fusion_math.py -k global_alpha` |
-| F8 | `[x]` KD teacher is the pre-merge old adapter, captured before fusion | `pytest tests/test_kd.py -k teacher_identity` |
-| F9 | `[x]` `λ=0` reproduces the no-KD arm exactly | `pytest tests/test_kd.py -k lambda_zero` |
-| F10 | `[x]` Fusion's extra trainable parameter count reported | `pytest tests/test_fusion_math.py -k param_count` |
+| F8 | `[x]` KD teacher is the pre-merge old adapter, captured before fusion | `pytest tests/test_kd.py -k teacher` |
+| F9 | `[x]` `λ=0` reproduces the no-KD arm exactly | `pytest tests/test_ablation_toggles.py -k a4_kd` |
+| F10 | `[x]` Fusion's extra trainable parameter count reported | `pytest tests/test_fusion_math.py -k parameter_cost` |
 
 ## G. Continual and federated
 
@@ -89,11 +93,11 @@ Legend: `[x]` verified by the listed command · `[~]` implemented, verification 
 |---|---|---|
 | G1 | `[x]` Sequential arrival pipeline runs end to end | `pytest tests/test_continual_runner.py` |
 | G2 | `[x]` AvgPerf / Forgetting / BWT / FWT correct on a known matrix | `pytest tests/test_cl_metrics.py` |
-| G3 | `[x]` Performance matrix persisted and metrics recomputable | `pytest tests/test_cl_metrics.py -k persist` |
-| G4 | `[x]` TASK/CLIENT/ADAPTER/ROUND are distinct axes | `pytest tests/test_federated_axes.py` |
-| G5 | `[x]` Aggregation weights sum to 1; only compatible adapters averaged | `pytest tests/test_federated_aggregation.py` |
-| G6 | `[x]` Backbone never in a payload | `pytest tests/test_federated_aggregation.py -k no_backbone` |
-| G7 | `[x]` Communication cost measured from real serialised bytes | `pytest tests/test_comm_accounting.py` |
+| G3 | `[x]` Performance matrix persisted and metrics recomputable | `pytest tests/test_cl_metrics.py -k persists` |
+| G4 | `[x]` TASK/CLIENT/ADAPTER/ROUND are distinct axes | `pytest tests/test_federated.py -k axis` |
+| G5 | `[x]` Aggregation weights sum to 1; only compatible adapters averaged | `pytest tests/test_federated.py` |
+| G6 | `[x]` Backbone never in a payload | `pytest tests/test_federated.py -k backbone` |
+| G7 | `[x]` Communication cost measured from real serialised bytes | `pytest tests/test_federated.py -k communication` |
 
 ## H. Baselines, evaluation, ablations
 
@@ -111,9 +115,9 @@ Legend: `[x]` verified by the listed command · `[~]` implemented, verification 
 
 | # | Criterion | Verification |
 |---|---|---|
-| I1 | `[x]` `run_mode` required, no default | `pytest tests/test_config.py -k run_mode_required` |
+| I1 | `[x]` `run_mode` required, no default | `pytest tests/test_config.py -k no_default` |
 | I2 | `[x]` Artefacts under `results/<run_mode>/<id>/`, cross-mode writes blocked | `pytest tests/test_tracking_paths.py` |
-| I3 | `[x]` Provenance captured (git, versions, platform, seed, device) | `pytest tests/test_provenance.py` |
+| I3 | `[x]` Provenance captured (git, versions, platform, seed, device) | `pytest tests/test_tracking_paths.py -k provenance` |
 | I4 | `[x]` Resolved config hashing is stable | `pytest tests/test_config.py -k hash` |
 | I5 | `[x]` Quantisation unavailability raises, never silently downgrades | `pytest tests/test_config.py -k quantization` |
 | I6 | `[x]` Smoke test passes end to end on `dummy` | `python scripts/run_smoke.py --run-mode dummy` |
@@ -124,7 +128,7 @@ Legend: `[x]` verified by the listed command · `[~]` implemented, verification 
 
 | # | Criterion | Status |
 |---|---|---|
-| J1 | Agent 3 independent audit completed | `[x]` see `docs/review_report_2026-09-19.md` |
-| J2 | All CRITICAL findings resolved | `[x]` |
-| J3 | All HIGH findings resolved or explicitly deferred with reason | `[~]` see report |
+| J1 | Agent 3 independent audit completed | `[x]` `docs/review_report_2026-09-19.md` — 1 CRITICAL, 7 HIGH, 6 MEDIUM, 3 LOW |
+| J2 | All CRITICAL findings resolved | `[x]` CRITICAL-1 (TEST scores reached the decision) fixed; regression test `tests/test_no_test_leakage_into_decisions.py` |
+| J3 | All HIGH findings resolved or explicitly deferred with reason | `[~]` 3 of 7 resolved; 4 deferred with reasons (no run executed; stream cannot falsify H2/H3; unequal arm budgets; B1 unimplemented) |
 | J4 | Experiments completed | `[ ]` **no experiment has been run** — blocked on D-002/D-003/D-006 sign-off and a CUDA host |

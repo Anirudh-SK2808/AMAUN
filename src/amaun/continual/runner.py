@@ -84,6 +84,8 @@ class TaskEvent:
     compression: dict[str, Any] | None = None
     efficiency: dict[str, Any] = field(default_factory=dict)
     evaluations: list[dict[str, Any]] = field(default_factory=list)
+    #: VALIDATION scores used as continual-feature inputs (never TEST) -- see _prior_scores.
+    validation_scores: dict[str, float] = field(default_factory=dict)
     wall_seconds: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
@@ -148,6 +150,10 @@ class ContinualRunner:
         self.baseline_fingerprint = backbone.fingerprint
         self.representations: dict[str, TaskRepresentation] = {}
         self.matrix = PerformanceMatrix(task_order=[], score_name="primary_score")
+        # Continual-learning FEATURES must not be derived from the TEST-filled matrix above:
+        # that would let evaluation data influence a decision (master-prompt constraint 13).
+        # This parallel history is filled from VALIDATION only and is what the manager reads.
+        self.validation_history = PerformanceMatrix(task_order=[], score_name="primary_score")
         self.events: list[TaskEvent] = []
         self._stream: list[str] = []
         self._cumulative_train_seconds = 0.0
@@ -322,20 +328,53 @@ class ContinualRunner:
         return contexts
 
     def _prior_scores(self, *, before: bool) -> dict[str, float]:
-        """Prior-task scores from the performance matrix (never from TEST directly).
+        """Prior-task scores for the continual feature family, from VALIDATION only.
 
-        The matrix is filled by the evaluator; the manager reads *already-recorded* history,
-        which is history about the past, not information about the current decision's test set.
+        These values feed ``z_cl`` and therefore the utility network and the decision.  Reading
+        them from ``self.matrix`` -- which the evaluator fills from TEST -- would let evaluation
+        data influence adapter selection, violating master-prompt constraint 13 and idea.md
+        S16.5.  ``self.validation_history`` is the leakage-safe source; it is filled by
+        :meth:`_record_validation_scores` through a guard that permits VALIDATION and not TEST.
         """
-        if len(self.matrix.task_order) < 2:
+        rows = self.validation_history.task_order
+        if len(rows) < 2:
             return {}
-        rows = self.matrix.task_order
         row = rows[-2] if before else rows[-1]
         return {
             task: value
             for task in rows[:-1]
-            if (value := self.matrix.get(row, task)) is not None
+            if (value := self.validation_history.get(row, task)) is not None
         }
+
+    def _record_validation_scores(self, current_task_id: str) -> dict[str, float]:
+        """Score every task seen so far on VALIDATION, for the continual features.
+
+        Uses a utility guard (TRAIN / VALIDATION / SUPPORT) so a TEST read is impossible here by
+        construction, and caps the example count because these scores are decision inputs, not
+        reported metrics.
+        """
+        from amaun.data.splits import utility_guard
+
+        scores: dict[str, float] = {}
+        if current_task_id not in self.validation_history.task_order:
+            self.validation_history.task_order.append(current_task_id)
+        for task_id in self.validation_history.task_order:
+            adapter_id = self._adapter_serving(task_id)
+            if adapter_id and adapter_id in self.repository:
+                load_delta_into(self.peft_model, self.repository.retrieve(adapter_id).delta)
+            else:
+                continue
+            try:
+                result = self.evaluator.evaluate(
+                    self.tasks[task_id], utility_guard(self.splits[task_id]),
+                    model=self.peft_model, adapter_id=adapter_id, split=SplitName.VALIDATION,
+                )
+            except Exception as exc:  # a missing split must not abort the run
+                log.warning("validation scoring failed for '%s': %s", task_id, exc)
+                continue
+            self.validation_history.record(current_task_id, task_id, result.primary_score)
+            scores[task_id] = result.primary_score
+        return scores
 
     # -- the task event ----------------------------------------------------------
     def run_task(self, task_id: str, task_index: int) -> TaskEvent:
@@ -452,6 +491,9 @@ class ContinualRunner:
             training_seconds_cumulative=self._cumulative_train_seconds,
         )
 
+        # Fill the leakage-safe validation history for the NEXT task's continual features.
+        validation_scores = self._record_validation_scores(task_id)
+
         event = TaskEvent(
             task_index=task_index,
             task_id=task_id,
@@ -465,6 +507,7 @@ class ContinualRunner:
             compression=compression_payload,
             efficiency=efficiency.as_dict(),
             evaluations=evaluations,
+            validation_scores=validation_scores,
             wall_seconds=time.perf_counter() - start,
         )
         self.events.append(event)
@@ -535,22 +578,38 @@ class ContinualRunner:
         before = self.repository.memory_bytes()
 
         if mechanism is CompressionMechanism.UTILITY and isinstance(self.strategy, AmaunStrategy):
-            def pair_utility(left: AdapterEntry, right: AdapterEntry) -> float:
-                # Reuses the SAME utility mechanism as selection (idea.md S16.7), by building
-                # a candidate context that treats one stored adapter as the "temporary" one.
+            def _directed_utility(source: AdapterEntry, target: AdapterEntry) -> float:
+                """Utility of integrating ``source`` into ``target``, using the SAME mechanism
+                as selection (idea.md S16.7)."""
                 ctx = CandidateContext(
-                    temp_id=left.adapter_id, temp_delta=left.delta,
-                    candidate_id=right.adapter_id, candidate_delta=right.delta,
-                    candidate_metadata=right.metadata, task_index=task_index,
+                    temp_id=source.adapter_id, temp_delta=source.delta,
+                    candidate_id=target.adapter_id, candidate_delta=target.delta,
+                    candidate_metadata=target.metadata, task_index=task_index,
                     total_events=max(1, len(self.events)),
-                    task_embedding=left.metadata.task_embedding,
-                    candidate_task_embedding=right.metadata.task_embedding,
+                    task_embedding=source.metadata.task_embedding,
+                    candidate_task_embedding=target.metadata.task_embedding,
                     repository_bytes=float(self.repository.memory_bytes()),
                     repository_size=len(self.repository),
                 )
                 vector = self.extractor.extract(ctx)
-                scored = self.strategy.score({right.adapter_id: vector}, run_mode=self.cfg.run_mode.value)
+                scored = self.strategy.score(
+                    {target.adapter_id: vector}, run_mode=self.cfg.run_mode.value
+                )
                 return scored[0].utility if scored else float("-inf")
+
+            def pair_utility(left: AdapterEntry, right: AdapterEntry) -> float:
+                """Symmetric pair utility.
+
+                idea.md S7.2 writes ``argmax_{i != j} U_merge(A_i, A_j)`` over UNORDERED pairs,
+                but the feature vector is directional: historical, performance and resource
+                features describe the *candidate* only, so U(i,j) != U(j,i). Taking the mean of
+                both directions makes the score symmetric, so the chosen pair does not depend on
+                the repository's iteration order.
+                """
+                forward = _directed_utility(left, right)
+                backward = _directed_utility(right, left)
+                finite = [v for v in (forward, backward) if v > float("-inf")]
+                return sum(finite) / len(finite) if finite else float("-inf")
         else:
             from amaun.manager.compression import heuristic_pair_utility
 
@@ -645,12 +704,23 @@ class ContinualRunner:
         return results
 
     def _adapter_serving(self, task_id: str) -> str | None:
-        """Which repository adapter currently serves ``task_id`` (most recent wins)."""
-        best: str | None = None
-        for entry in self.repository.entries():
-            if task_id in entry.metadata.tasks_served:
-                best = entry.adapter_id
-        return best
+        """Which repository adapter currently serves ``task_id``.
+
+        Several adapters can legitimately claim a task after a fusion or a reuse, so the tie
+        is broken explicitly and deterministically: the most recently created adapter wins
+        (highest ``created_at_task_index``, then adapter id). Relying on repository iteration
+        order would make evaluation depend on dict ordering.
+        """
+        candidates = [
+            entry for entry in self.repository.entries()
+            if task_id in entry.metadata.tasks_served
+        ]
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda e: (e.metadata.created_at_task_index or -1, e.adapter_id)
+        )
+        return candidates[-1].adapter_id
 
     # -- the stream --------------------------------------------------------------
     def run(self, stream: Sequence[str]) -> RunnerResult:

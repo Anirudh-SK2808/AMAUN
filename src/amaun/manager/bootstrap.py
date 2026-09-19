@@ -101,20 +101,23 @@ def _validation_loss(model: Any, delta: AdapterDelta, task: TaskSpec, splits: Ta
     return float(masked_cross_entropy(logits, batch.labels))
 
 
-def _loss_to_score(loss: float) -> float:
+def _loss_to_score(loss: float, *, scale: float) -> float:
     """Map a validation loss to a bounded score in (0,1] for the ``primary_score`` head.
 
-    A proxy for task score during bootstrapping: generating and scoring text for every
-    candidate pair would multiply the already-dominant bootstrap cost (D-010).  This is a
-    monotone transform of loss, so it preserves the *ordering* the utility head needs, and the
-    fact that it is a proxy is recorded in the bootstrap notes so it cannot be mistaken for a
-    measured task metric.
+    A proxy for task score during bootstrapping: generating and scoring text for every candidate
+    pair would multiply the already-dominant bootstrap cost (D-010).  ``exp(-loss/scale)`` is a
+    strictly monotone transform, so it preserves the *ordering* the utility head needs.
+
+    ``scale`` is a config value (``utility.supervision.loss_to_score_scale``), not a literal:
+    it changes how much utility differences compress at high loss, which is an
+    experiment-affecting choice (development rule 7).  The fact that these targets are proxies is
+    recorded in the bootstrap notes so they cannot be mistaken for measured task metrics.
     """
     import math
 
-    if not math.isfinite(loss):
+    if not math.isfinite(loss) or scale <= 0:
         return 0.0
-    return float(math.exp(-max(0.0, loss) / 10.0))
+    return float(math.exp(-max(0.0, loss) / scale))
 
 
 def bootstrap_utility_network(
@@ -149,6 +152,7 @@ def bootstrap_utility_network(
     fusion_cfg = FusionConfig.from_config(cfg.section("fusion"), lora_learning_rate=train_cfg.learning_rate)
     kd_cfg = KDConfig.from_config(cfg.section("kd"))
     max_eval = int(cfg.get("features.performance.max_eval_examples", 8))
+    score_scale = float(cfg.get("utility.supervision.loss_to_score_scale"))
 
     proxy_steps = int(supervision_cfg["proxy_steps"])
     proxy_validation_frac = float(supervision_cfg.get("proxy_validation_frac", 0.0))
@@ -174,7 +178,7 @@ def bootstrap_utility_network(
             peft_model, temp_delta, task, task_splits, backbone.tokenizer, backbone.device,
             max_examples=max_eval,
         )
-        baseline_score = _loss_to_score(temp_loss)
+        baseline_score = _loss_to_score(temp_loss, scale=score_scale)
 
         # Features for every candidate (cheap relative to fusion).
         vectors = {}
@@ -257,21 +261,23 @@ def bootstrap_utility_network(
                         _validation_loss(
                             peft_model, entry.delta, prior_task, splits[prior_id],
                             backbone.tokenizer, backbone.device, max_examples=max_eval,
-                        )
+                        ),
+                        scale=score_scale,
                     )
                     after = _loss_to_score(
                         _validation_loss(
                             peft_model, fused_delta, prior_task, splits[prior_id],
                             backbone.tokenizer, backbone.device, max_examples=max_eval,
-                        )
+                        ),
+                        scale=score_scale,
                     )
                     drops.append(max(0.0, before - after))
                 forgetting = sum(drops) / len(drops) if drops else 0.0
 
             targets, beneficial = measure_outcome_targets(
-                primary_score_post=_loss_to_score(post_loss),
+                primary_score_post=_loss_to_score(post_loss, scale=score_scale),
                 forgetting_post=forgetting,
-                confidence_post=_loss_to_score(post_loss),
+                confidence_post=_loss_to_score(post_loss, scale=score_scale),
                 memory_bytes_post=fused_delta.storage_bytes(),
                 communication_bytes_post=fused_delta.storage_bytes(),
                 long_term_loss_post=post_loss if post_loss == post_loss else 0.0,

@@ -55,12 +55,19 @@ utility:
     pair_sampling: stratified_by_feature   # all | random | stratified_by_feature
     proxy_steps: 20                 # truncated fusion+KD run used as a cheap target
     proxy_validation_frac: 0.25     # fraction also run to convergence, to MEASURE proxy bias
+    # Bootstrap targets use exp(-validation_loss / scale) as a monotone PROXY for task score,
+    # because generating and scoring text for every candidate pair would dominate the budget.
+    # The scale changes how utility differences compress at high loss, so it is a config value.
+    loss_to_score_scale: 10.0
   normalisation:
     fit_split: utility_train        # never test (invariant I6.2)
     epsilon: 1.0e-8
 
 manager:
   decision_order: prescreen_then_train   # prescreen_then_train | train_then_decide (D-003)
+  # REUSE pre-screen: an existing adapter must be no worse than the freshly trained temporary
+  # adapter on SUPPORT by more than this margin (in loss units; 0.0 = no worse at all).
+  reuse_prescreen_margin: 0.0
   retrieval:
     mode: top_k                     # single | top_k
     k: 3
