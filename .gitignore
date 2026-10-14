@@ -23,3 +23,7 @@ results/dummy/**
 adapters/dummy/**
 
 .DS_Store
+
+# Local HF model snapshots (~3.1 GB for local_smoke); reconstructible via scripts/fetch_backbone.py.
+data/models/**
+!data/models/.gitkeep

@@ -18,8 +18,10 @@ an experiment may appear anywhere else in the codebase.
 **Contract.**
 - `RunMode` enum: `dummy | local_smoke | actual`. **No default.**
 - `BACKBONE_REGISTRY: dict[RunMode, BackboneSpec]` is the *only* place a checkpoint id
-  appears. `BackboneSpec` = `(model_id, dtype, max_seq_len, attn_impl, quantization,
-  device_preference, is_reportable)`.
+  appears. `BackboneSpec` = `(model_id, revision, dtype, max_seq_len, attn_impl, quantization,
+  device_preference, is_reportable)`. `revision` is a 40-hex commit sha (D-001 requires the
+  checkpoint tag to be pinned once chosen); `None` means unpinned-and-floating and is
+  acceptable only for the `dummy` tier, which downloads nothing.
 - `resolve(cfg) -> ResolvedConfig` performs: run-mode lookup, device feasibility check,
   quantisation availability check, cross-field validation, and produces a stable
   `config_hash` (sha256 over canonical JSON of the resolved tree).
@@ -56,6 +58,17 @@ an experiment may appear anywhere else in the codebase.
   optimiser step** in every trainer (cheap: cached parameter-name set).
 - `backbone_fingerprint(model)` returns a hash of a deterministic sample of backbone weights,
   recorded before and after every training phase to prove the weights did not move.
+- Non-`dummy` tiers load from a **local snapshot**: `model.cache_dir`, `model.revision`, and
+  `model.local_files_only` are passed to both `from_pretrained` calls, so a tier can run with
+  the network disabled once `scripts/fetch_backbone.py` has populated the cache. That script
+  writes `backbone_cache.json` (`repo_id`, resolved sha, file list, bytes,
+  `verified_offline_load`) and refuses `run_mode=dummy`.
+
+**Invariant.** `I1.5` If `BackboneSpec.revision` is set, the resolved snapshot commit must
+equal it; a mismatch raises rather than loading a different checkpoint.
+
+**Config keys.** `model.cache_dir`, `model.local_files_only`, `model.revision`, `model.model_id`,
+`model.max_seq_len`, `model.quantization`, `model.device`.
 
 **Equations.** `θ_{k+1} = θ_k = θ_0`; `W_l^adapt = W_l^0 + ΔW_l`.
 
@@ -90,7 +103,33 @@ an experiment may appear anywhere else in the codebase.
   `{SUPPORT}` only; the evaluator's permits `{TEST}` only.
 - `synthetic` provider generates deterministic pseudo-data per task type so tests and
   `dummy` runs need no network.
-- Unpinned datasets (D-006 B1/B2) raise `UnpinnedDatasetError` rather than guessing.
+- Unpinned datasets raise `UnpinnedDatasetError` rather than guessing. "Pinned" means a
+  specific revision: every `hf_revision` is a 40-hex commit sha, or `refs/convert/parquet`
+  recorded together with that ref's resolved sha (D-006).
+- **Row adapters** (`row_adapters.py`) map one upstream row to
+  `list[(prompt fields, target)]`. The adapter is named per task in config
+  (`datasets.tasks.<id>.row_adapter`) with **no default**; unset or unknown raises
+  `UnresolvedRowAdapterError` (D-015). `passthrough` selects `input_fields` directly and
+  reduces list/dict targets by the explicit `list_target_pick` option. `TaskSpec.input_fields`
+  means *prompt-template slots*; upstream column names are the adapter's concern, and by
+  convention the two coincide wherever the upstream schema permits.
+- **Snapshots** (`snapshots.py`) cache the *capped* sample of raw upstream rows under
+  `data.cache_dir` as `<task>/<split>-<key>.jsonl` + `.manifest.json`. The key hashes every
+  content-determining input (`hf_id`, `hf_revision`, `hf_config`, split, size, `skip`,
+  `sampling`, `shuffle_buffer_size`, row adapter + options, required fields), so a stale
+  snapshot can never be silently reused. A cache hit performs **no network call**, which is
+  what makes an offline re-run possible.
+- **Volume caps come only from config.** Under `provider: huggingface`,
+  `data.volumes.<task>.{train_pool,test,test_split}` are mandatory; there is no code default
+  (M0). `data.sampling` and `data.shuffle_buffer_size` are likewise mandatory with no code
+  default; per D-016 the configured policy is `shuffled_buffer`, and the buffer must satisfy
+  `≥ max(train_pool, test)` or the shuffle is a no-op. The shuffle seed derives from
+  `data.seed` and the task id, and is identical across both loads of a task.
+- **Single-split corpora.** When the TEST pool is drawn from the same upstream split as the
+  training pool (e.g. `databricks/databricks-dolly-15k`, which has only `train`),
+  `data.volumes.<task>.test_offset` is **required** and is applied as a streaming `.skip(n)`.
+  HF streaming does not support slice syntax (`split="train[12000:]"` raises `ValueError:
+  Bad split`), so an offset is the mechanism.
 
 **Invariants.**
 - `I2.1` `hash(SUPPORT) ∩ hash(TEST) = ∅`, likewise for every other split pair.
@@ -99,11 +138,28 @@ an experiment may appear anywhere else in the codebase.
 - `I2.4` The manager cannot obtain a `TEST` iterator — enforced by type, then by guard.
 - `I2.5` Under `local_smoke`, subsampling applies uniformly to all four splits with one
   config key (`data.smoke_max_examples_per_split`), defined once.
+- `I2.6` When the TEST pool shares an upstream split with the training pool,
+  `test_offset ≥ rows_consumed_by_the_training_pool`, checked against the **measured** row
+  count (which differs from the example count whenever a row adapter expands rows). Violation
+  raises `DataError`. Independently, `assert_disjoint` still catches any resulting content
+  overlap — the offset is the fix, the hash check is the proof.
+- `I2.7` A snapshot is reused only when its manifest matches the requested spec exactly; a
+  cache hit makes no network call.
+- `I2.7a` Under `sampling: shuffled_buffer` the stream is shuffled **before** it is skipped,
+  with a seed derived from `(data.seed, task_id)`, so two loads of one task see the same row
+  order. Without this, `I2.6`'s offset is not a disjointness argument.
+- `I2.8` Only `unpinned_dataset` (D-006) and `unresolved_row_adapter` (D-015) may cause a task
+  to be skipped. Any other failure propagates, so a transient network error can never
+  masquerade as an open decision.
 
-**Config keys.** `data.provider`, `data.volumes.*`, `data.split_ratios.*`,
-`data.smoke_max_examples_per_split`, `data.cache_dir`, `data.seed`.
+**Config keys.** `data.provider`, `data.volumes.<task>.{train_pool,test,test_split,test_offset}`,
+`data.split_ratios.*`, `data.smoke_max_examples_per_split`, `data.cache_dir`, `data.seed`,
+`data.sampling`, `data.shuffle_buffer_size`, `data.offline_snapshots`,
+`datasets.tasks.<id>.{hf_id,hf_revision,hf_config,row_adapter,row_adapter_options}`.
 
-**Tests.** `tests/test_split_isolation.py`, `tests/test_data_registry.py`
+**Tests.** `tests/test_split_isolation.py`, `tests/test_data_registry.py`,
+`tests/test_row_adapters.py`, `tests/test_data_snapshots.py`,
+`tests/test_single_split_carving.py`, `tests/test_prepare_data_blocked.py`
 
 ---
 

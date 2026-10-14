@@ -39,6 +39,8 @@ src/amaun/
 ├── data/
 │   ├── registry.py            M2  TaskSpec table, licenses, revisions, pin checks
 │   ├── providers.py           M2  huggingface | synthetic providers
+│   ├── row_adapters.py        M2  named row→example rules, no default (D-015)
+│   ├── snapshots.py           M2  content-keyed bounded offline dataset cache
 │   ├── splits.py              M2  deterministic hash-based 4-way split
 │   ├── preprocess.py          M2  prompt templates, tokenisation, response masking
 │   ├── loaders.py             M2  SplitAccessGuard-wrapped dataloaders
@@ -113,6 +115,14 @@ in 24 GB at 1.5B and on a single 40–80 GB GPU at 7B.
 **6. `BudgetLedger` gates comparisons.**
 Baseline fairness is enforced mechanically rather than trusted (falsification question 9/14).
 
+**7a. Dataset access is config-declared end to end.**
+A task's identity (`hf_id` + a 40-hex `hf_revision`), its row→example rule (`row_adapter`), its
+volume cap (`data.volumes.<task>`), and its sampling policy (`data.sampling`) all come from
+`configs/`, with no code default for any of them. The provider is task-agnostic: there is no
+`if task_id == …` branch anywhere in `data/`, so adding or re-pinning a task is a config edit.
+The on-disk snapshot cache is keyed by every one of those values, so changing one can never
+silently reuse data produced under another.
+
 **7. Run-mode-namespaced everything.**
 `paths.py` is the only module that constructs result paths, and it takes `RunMode` as a
 required argument, so `idea.md` §0.1.1's separation cannot be bypassed by a stray
@@ -123,5 +133,10 @@ required argument, so `idea.md` §0.1.1's separation cannot be bypassed by a str
 | Mode | Backbone | Data | Purpose |
 |---|---|---|---|
 | `dummy` | tiny local random Qwen2 | `synthetic` | `pytest`, CI, wiring/invariant tests, seconds |
-| `local_smoke` | Qwen2.5-1.5B-Instruct | real, subsampled | full pipeline validation, minutes, MPS |
+| `local_smoke` | Qwen2.5-1.5B-Instruct, from a pinned local snapshot | real, capped, snapshotted | full pipeline validation, minutes, MPS |
 | `actual` | Qwen2.5-7B-Instruct | full | reported experiments, CUDA required for QLoRA |
+
+`dummy` is the only tier that stays offline by construction, and it is therefore the tier that
+guarantees *all six* curriculum tasks are exercised (`idea.md` §0.2.1). A `local_smoke` run
+covers whatever subset of tasks is fully specified — tasks blocked by an `OPEN` decision are
+skipped, reason-coded, and reported, never guessed at.

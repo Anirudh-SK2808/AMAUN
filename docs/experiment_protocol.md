@@ -11,7 +11,10 @@ A run may write to `results/actual/` only if **all** hold:
 
 1. `pytest -q` is fully green on the `dummy` tier.
 2. `scripts/run_smoke.py --run-mode local_smoke` completed end to end, exercising every
-   module at least once (`idea.md` §0.2.1).
+   module at least once (`idea.md` §0.2.1). Its prerequisites, in order:
+   `scripts/fetch_backbone.py --run-mode local_smoke` (pinned local snapshot, verified to load
+   offline) then `scripts/prepare_data.py --run-mode local_smoke` (real data, four-way splits,
+   clean leakage audit). See `specs/local-smoke-data-bootstrap/`.
 3. The git tree is clean, or `experiment.allow_dirty_git: true` is set explicitly.
 4. Every `OPEN` decision in `docs/decision_register.md` that the run depends on is
    `RESOLVED`.
@@ -39,18 +42,41 @@ upstream-validation or a held-out slice of upstream-train → TEST (never the up
 *test* split for datasets whose test labels are hidden, e.g. SQuAD — documented per task in
 `configs/datasets/`).
 
+**Single-split corpora.** Where the upstream dataset has only `train`
+(`databricks/databricks-dolly-15k`), TEST is carved from a **disjoint row window** of that same
+split via `data.volumes.<task>.test_offset`, and `test_offset ≥ rows_consumed_by_the_training_pool`
+is enforced against the measured row count (invariant `I2.6`). Without the offset both pools are
+the same prefix of the stream, and the resulting TEST ⊆ TRAIN is caught by `assert_disjoint`,
+which aborts the run.
+
+**Sampling under a cap.** Every load is capped, so *which* rows the cap selects is an
+experimental variable. `data.sampling` has no code default and must be declared per run; it is
+**`shuffled_buffer`** for every tier (D-016, resolved 2026-09-22), with
+`data.shuffle_buffer_size ≥ max(train_pool, test)` — a narrower window makes the shuffle a
+no-op and would misreport the policy. The shuffle seed derives from `data.seed` and is identical
+across both loads of a task, which is what keeps the offset-based carving above valid.
+
 ## 3. Task curriculum
 
 Base curriculum (`idea.md` §0.2):
 
 | Adapter | Task | Dataset | `actual` volume |
 |---|---|---|---|
-| LoRA-1 | Summarization | CNN/DailyMail 3.0.0 | 30k–50k train |
-| LoRA-2 | Question answering | SQuAD v1.1 | 30k–50k train |
-| LoRA-3 | Instruction following | **unpinned (D-006 B1)** | 30k–50k train |
-| LoRA-4 | Dialogue generation | DailyDialog | ~8k–10k train |
-| LoRA-5 | Long-form generation | **unpinned (D-006 B2)** | 20k–30k train |
-| LoRA-6 | Domain-specific generation | FinQA | 10k–20k train |
+| LoRA-1 | Summarization | `abisee/cnn_dailymail` @ sha, config `3.0.0` | 30k–50k train |
+| LoRA-2 | Question answering | `rajpurkar/squad` @ sha | 30k–50k train |
+| LoRA-3 | Instruction following | `databricks/databricks-dolly-15k` @ sha (D-006 B1) | **capped by the corpus: 15 011 rows total** |
+| LoRA-4 | Dialogue generation | `li2017dailydialog/daily_dialog` @ `refs/convert/parquet` | ~8k–10k train |
+| LoRA-5 | Long-form generation | `Pavithree/eli5` @ sha (D-006 B2) | 20k–30k train |
+| LoRA-6 | Domain-specific generation | `dreamerdeo/finqa` @ sha | 10k–20k train |
+
+Row→example rules are fixed by D-015 (resolved 2026-09-22): `dialog` → `dialog_last_turn`
+(one example per dialogue), `domain` → `finqa_pre_table_post` with `table_format: markdown`,
+`longform` target → `answers.text[argmax(score)]`. All six tasks therefore load.
+
+`actual`-tier volumes remain unresolved (`data.volumes: null` at base level): `idea.md` §0.2
+gives ranges, and LoRA-3's range is no longer achievable — dolly-15k has 15 011 rows in total,
+so the `actual` volume for `instr` must be set deliberately and its inequality with the other
+tasks disclosed. This is now the principal data-side gate on a reportable run.
 
 **Required extension (D-002).** Under `repository_init: bootstrap_six`, the evaluated task
 stream consists of *new* tasks `T₇…`, and at least some of them must plausibly overlap an

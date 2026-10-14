@@ -280,7 +280,19 @@ class _DummyTokenizer:
         return result
 
 
-def _load_pretrained(spec: BackboneSpec, device: str) -> tuple[Any, Any]:
+def _load_pretrained(
+    spec: BackboneSpec,
+    device: str,
+    *,
+    cache_dir: str | None = None,
+    local_files_only: bool = False,
+) -> tuple[Any, Any]:
+    """Load the pinned checkpoint from a local snapshot.
+
+    ``cache_dir`` / ``local_files_only`` come from ``model.*`` in the resolved config and
+    ``revision`` from :class:`BackboneSpec`, so the *exact* checkpoint a run used is recorded in
+    ``config_used.json`` rather than being whatever ``main`` happened to point at.
+    """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     if spec.model_id is None:
@@ -289,6 +301,9 @@ def _load_pretrained(spec: BackboneSpec, device: str) -> tuple[Any, Any]:
     kwargs: dict[str, Any] = {
         "dtype": _DTYPES[spec.dtype],
         "attn_implementation": spec.attn_implementation,
+        "revision": spec.revision,
+        "cache_dir": cache_dir,
+        "local_files_only": local_files_only,
     }
     if spec.quantization is not Quantization.NONE:
         from transformers import BitsAndBytesConfig
@@ -304,11 +319,20 @@ def _load_pretrained(spec: BackboneSpec, device: str) -> tuple[Any, Any]:
             kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
         kwargs["device_map"] = {"": 0}
 
-    log.info("loading backbone %s (dtype=%s, quant=%s)", spec.model_id, spec.dtype, spec.quantization.value)
+    log.info(
+        "loading backbone %s (revision=%s, dtype=%s, quant=%s, cache_dir=%s, local_files_only=%s)",
+        spec.model_id, spec.revision, spec.dtype, spec.quantization.value,
+        cache_dir, local_files_only,
+    )
     model = AutoModelForCausalLM.from_pretrained(spec.model_id, **kwargs)
     if spec.quantization is Quantization.NONE:
         model = model.to(device)
-    tokenizer = AutoTokenizer.from_pretrained(spec.model_id)
+    tokenizer = AutoTokenizer.from_pretrained(
+        spec.model_id,
+        revision=spec.revision,
+        cache_dir=cache_dir,
+        local_files_only=local_files_only,
+    )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     return model, tokenizer
@@ -366,7 +390,12 @@ def _load(cfg: ResolvedConfig) -> LoadedBackbone:
     if cfg.run_mode is RunMode.DUMMY:
         model, tokenizer = _build_dummy(spec, cfg.device)
     else:
-        model, tokenizer = _load_pretrained(spec, cfg.device)
+        model, tokenizer = _load_pretrained(
+            spec,
+            cfg.device,
+            cache_dir=cfg.get("model.cache_dir", None),
+            local_files_only=bool(cfg.get("model.local_files_only", False)),
+        )
 
     frozen = freeze_backbone(model)
     assert_backbone_frozen(model, allow=set())  # nothing may be trainable yet

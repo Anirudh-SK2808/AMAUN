@@ -6,6 +6,9 @@ model:
   quantization: null        # null => registry default (nf4 for actual, none otherwise)
   max_seq_len: null         # null => registry default
   use_chat_template: true   # instruct backbones expect their own template
+  revision: null            # null => BackboneSpec.revision from the registry (D-001)
+  cache_dir: data/models    # local HF snapshot root; populated by scripts/fetch_backbone.py
+  local_files_only: false   # true => refuse any network call (offline re-load verification)
 
 lora:
   # LoRA hyperparameters. TO BE TUNED on VALIDATION only (protocol S8).

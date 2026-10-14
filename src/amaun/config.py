@@ -69,6 +69,10 @@ class BackboneSpec:
     device_preference: tuple[str, ...]
     is_reportable: bool
     notes: str = ""
+    # The exact upstream commit the checkpoint was downloaded at (D-001 asks for the tag to be
+    # pinned once chosen).  ``None`` means "not pinned": either the tier builds its backbone
+    # locally (dummy) or the checkpoint has not yet been fetched on this host.
+    revision: str | None = None
 
 
 # The one and only checkpoint table (idea.md S0.1 BACKBONE_REGISTRY).
@@ -82,6 +86,7 @@ BACKBONE_REGISTRY: dict[RunMode, BackboneSpec] = {
         device_preference=("cpu",),
         is_reportable=False,
         notes="Tiny randomly-initialised Qwen2 built in-process. Offline. Never reportable.",
+        revision=None,  # nothing is downloaded: the tier has no upstream checkpoint to pin.
     ),
     RunMode.LOCAL_SMOKE: BackboneSpec(
         model_id="Qwen/Qwen2.5-1.5B-Instruct",
@@ -92,6 +97,11 @@ BACKBONE_REGISTRY: dict[RunMode, BackboneSpec] = {
         device_preference=("mps", "cuda", "cpu"),
         is_reportable=False,
         notes="Pipeline validation only (idea.md S0.1). No quantisation: bitsandbytes has no MPS backend.",
+        # Pinned to the commit actually downloaded by scripts/fetch_backbone.py on 2026-09-22;
+        # see results/local_smoke/main_bootstrap/backbone_cache.json for the download record
+        # (10 files, 3_098_973_447 bytes). A differing sha now raises rather than loading a
+        # silently different checkpoint (FR-1.4).
+        revision="989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
     ),
     RunMode.ACTUAL: BackboneSpec(
         model_id="Qwen/Qwen2.5-7B-Instruct",
@@ -102,6 +112,9 @@ BACKBONE_REGISTRY: dict[RunMode, BackboneSpec] = {
         device_preference=("cuda",),
         is_reportable=True,
         notes="The only reportable tier. QLoRA requires CUDA (D-008).",
+        # Unpinned on purpose: the 7B checkpoint cannot be fetched or verified from this
+        # non-CUDA host, so pinning a sha here would record a value nobody measured (D-001).
+        revision=None,
     ),
 }
 
@@ -332,6 +345,13 @@ def resolve(
     if model_override:
         spec = BackboneSpec(**{**asdict(spec), "model_id": model_override,
                                "notes": spec.notes + f" [OVERRIDDEN to {model_override}]"})
+
+    # Optional explicit revision override.  A checkpoint's *identity* is (model_id, revision),
+    # so an override here is as consequential as overriding the id and is recorded the same way.
+    revision_override = raw.get("model", {}).get("revision")
+    if revision_override:
+        spec = BackboneSpec(**{**asdict(spec), "revision": str(revision_override),
+                               "notes": spec.notes + f" [REVISION OVERRIDDEN to {revision_override}]"})
 
     if raw.get("model", {}).get("max_seq_len"):
         spec = BackboneSpec(**{**asdict(spec), "max_seq_len": int(raw["model"]["max_seq_len"])})

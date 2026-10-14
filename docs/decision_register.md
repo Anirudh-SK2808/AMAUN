@@ -168,34 +168,152 @@ Implemented as `manager.threshold.selection ∈ {dev_stream, historical_cv, fixe
 
 ## D-006 — Dataset pinning, availability, and licensing
 
-**Status:** `OPEN` — **two concrete blockers.**
+**Status:** `RESOLVED` — 2026-09-22.
 
-`idea.md` §0.2 and brief §4 name six datasets loosely. Pinned proposals:
+**Decided by:** the user, on 2026-09-22, **relayed to the planning agent by the coordinating
+orchestrator agent rather than typed directly into this session.** That provenance is recorded
+here deliberately: an agent relay is not itself authority. If the attribution is wrong, revert
+this entry to `OPEN` *before any `actual` run* — these two rows determine what Adapters 3 and 5
+**are**, and the blast radius is every result table.
 
-| Task | Proposed HF id | Revision | License | Issue |
+`idea.md` §0.2 and brief §4 name six datasets loosely. Final pinned table (schemas and commit
+shas verified against the live HF API on 2026-09-22):
+
+| Task | HF id | Revision | License | Note |
 |---|---|---|---|---|
-| Summarization | `abisee/cnn_dailymail` | `3.0.0` | Apache-2.0 (code), news content under fair-use research terms | usable |
-| QA | `rajpurkar/squad` | v1.1 | CC BY-SA 4.0 | usable; share-alike applies to derivatives |
-| Instruction following | **unpinned** — "FLAN-style" is not a dataset | — | — | **BLOCKER B1** |
-| Dialogue | `li2017dailydialog/daily_dialog` | — | CC BY-NC-SA 4.0 | **non-commercial only**; fine for research, must be stated in any release |
-| Long-form generation | `eli5` | — | Reddit-derived | **BLOCKER B2** — the original `eli5` HF dataset was withdrawn over Reddit API/licensing; it is not reliably loadable |
-| Domain-specific | `ibm-research/finqa` (or `dreamerdeo/finqa`) | — | MIT (per repo) | usable; license must be re-verified at download time |
+| Summarization | `abisee/cnn_dailymail` | commit sha; `hf_config: 3.0.0` | Apache-2.0 (scripts), news content under fair-use research terms | `3.0.0` is a **config name, not a git ref** — the repo has only `main`/`script` branches |
+| QA | `rajpurkar/squad` | commit sha; `hf_config: plain_text` | CC BY-SA 4.0 | share-alike applies to derivatives |
+| Instruction following | **`databricks/databricks-dolly-15k`** (B1) | commit sha | CC BY-SA 3.0 | share-alike reaches derivatives. **One split only** (`train`, 15 011 rows) → TEST must be offset-carved, see D-015 and `specs/local-smoke-data-bootstrap/design.md` §4 |
+| Dialogue | `li2017dailydialog/daily_dialog` | `refs/convert/parquet` + its resolved sha | CC BY-NC-SA 4.0 | **non-commercial only**, must be stated in any release. `main` holds only a loading script, which `datasets` ≥ 4 cannot execute; the parquet conversion is the *same* dataset, mechanically converted |
+| Long-form generation | **`Pavithree/eli5`** (B2) | commit sha | **none declared on the mirror**; content Reddit-derived | `eli5_category` was rejected: its legacy script-loading format no longer loads. The undeclared license is a **residual publication risk** — a data statement must disclose it |
+| Domain-specific | `dreamerdeo/finqa` | commit sha | MIT (per source repo) | re-verified 2026-09-22. No `context` column; see D-015 (b) |
 
-**B1 — "FLAN-style" must be pinned.** Candidates: `Muennighoff/flan`,
-`SirNeural/flan_v2`, or a licensed subset of `databricks/databricks-dolly-15k` (CC BY-SA
-3.0). These differ substantially in mixture composition, which changes what Adapter 3
-*is*. Cannot be chosen by an agent.
+**B1 — resolved to `databricks/databricks-dolly-15k`.** Rejected alternatives were
+`Muennighoff/flan` and `SirNeural/flan_v2` (much larger, mixture composition harder to state
+precisely). Consequence: Adapter 3 is an *instruction-following* adapter over a 15 k
+human-authored set, not a FLAN-mixture adapter; the paper must say so rather than "FLAN-style".
+Real schema is `instruction`, `context`, `response`, `category` — **not** the
+`instruction`/`input`/`output` originally assumed in `configs/datasets/curriculum.yaml`.
+`context` is empty for many rows; an empty value is valid input, not a missing field.
 
-**B2 — ELI5 substitute needed.** Candidates: `eli5_category` (still Reddit-derived),
-`kilt_tasks`/`eli5` via KILT, or replace long-form generation with
-`allenai/wildchat`-style long responses or `cnn_dailymail`-disjoint long-form writing.
-Changing this changes what "long-form generation" means in the paper.
+**B2 — resolved to `Pavithree/eli5`.** A community mirror of the original ELI5 with proper
+`train`/`validation`/`test` splits (216 147 / 3 020 / 10 000). Real schema is `title`,
+`selftext`, `document`, `subreddit`, `url`, `answers{a_id,score,text}` — **not** the
+`question`/`answer` originally assumed. Which answer becomes the target is a live sub-decision
+(D-015 (c)).
 
-**Until B1/B2 are resol**, `configs/datasets/*.yaml` carries `hf_id: null` for those two
-rows and the loader raises a typed `UnpinnedDatasetError`. The offline `synthetic` provider
-covers tests and dummy-tier smoke runs so no work is blocked.
+**Remaining consequence:** "pinned" in this repo means *a specific revision*. Five of the six
+rows previously carried no revision at all; `specs/local-smoke-data-bootstrap/` pins all six to
+a 40-hex commit sha and adds a test that enforces the format, so "pinned but floating on
+`main`" cannot recur.
 
-**Decision:** _pending user sign-off on B1 and B2._
+---
+
+## D-015 — Row→example adaptation for multi-field / list-valued upstream schemas
+
+**Status:** `RESOLVED` — 2026-09-22. All three sub-parts decided as recommended:
+
+| Sub-part | Chosen | Config |
+|---|---|---|
+| (a) `dialog` turn segmentation | **`dialog_last_turn`** | `datasets.tasks.dialog.row_adapter: dialog_last_turn` |
+| (b) `domain` context composition | **`finqa_pre_table_post`**, `table_format: markdown` | `datasets.tasks.domain.row_adapter: finqa_pre_table_post` + `row_adapter_options.table_format: markdown` |
+| (c) `longform` target selection | **`highest_score`** | `datasets.tasks.longform.row_adapter_options.list_target_pick: highest_score` |
+
+**Decided by:** the user, on 2026-09-22, **relayed by the coordinating orchestrator agent**
+rather than typed into the planning session — the same provenance caveat as D-006 applies. If
+the attribution is wrong, revert to `OPEN` before any `actual` run: (a) and (b) change what
+Adapters 4 and 6 *are*, and (c) changes Adapter 5's targets.
+
+**Consequences to state in the paper.** `dialog` yields one example per dialogue (~11 k train),
+not one per turn prefix, so its volume is comparable to the other tasks. `domain`'s context is
+FinQA's original `pre_text` + markdown-serialised `table` + `post_text`, which is long against
+`max_input_tokens: 768` — truncation rates must be measured, not assumed. `longform`'s target
+is the highest-scored ELI5 answer, **not** `answers.text[0]`; any earlier synthetic-data run is
+therefore not comparable at the target level.
+
+The **mechanism** stays as designed: the rule is named per task in config with no code default,
+and an unset or unknown name still raises `UnresolvedRowAdapterError`. Resolving the decision
+selects a value; it does not remove the guard.
+
+The alternatives considered, retained for the record:
+
+Three of the pinned datasets do not expose the fields the task contract needs, so a rule must
+map an upstream row to `(prompt fields, target)`. Each rule changes **what the adapter learns**,
+so none may be chosen by an agent. Every option is reachable by config
+(`datasets.tasks.<id>.row_adapter` + `row_adapter_options`) with **no default**; an unset value
+raises `UnresolvedRowAdapterError` and the task is skipped and reported, never guessed.
+
+**(a) `dialog` — DailyDialog turn segmentation.** Upstream row is `dialog: list[str]`
+(+ `act`, `emotion`); the task contract wants `history` and `response`.
+
+| Option | Rule | Trade-off |
+|---|---|---|
+| **`dialog_last_turn`** | `history` = all but the last utterance; `target` = last utterance | One example per dialogue (~11 k train). The **only** reading consistent with the already-configured prompt template ("Continue the conversation naturally… Response:") |
+| `dialog_all_prefixes` | one example per prefix of ≥ 1 turn | ~7× more examples, shifts the context-length distribution, and changes the effective training volume relative to every other task |
+
+*Recommendation:* `dialog_last_turn` — lowest risk, matches the existing template, keeps
+per-task volumes comparable.
+
+**(b) `domain` — FinQA context composition.** Upstream row has `pre_text`, `post_text`,
+`table` (list of rows), `question`, `answer`; the task contract wants `context`.
+
+| Option | Rule | Trade-off |
+|---|---|---|
+| **`finqa_pre_table_post`** | `context` = `pre_text` + serialised `table` + `post_text`; `table_format ∈ {markdown, pipe_rows}` | Faithful to FinQA's original input. Table serialisation format is itself a choice, and tables inflate input length against `max_input_tokens: 768` |
+| `finqa_text_only` | table dropped | Shorter inputs, but many FinQA answers are unanswerable without the table — the task becomes materially easier/incoherent |
+
+*Recommendation:* `finqa_pre_table_post` with `table_format: markdown`.
+
+**(c) `longform` — which ELI5 answer is the target.** `answers` is
+`{a_id: [...], score: [...], text: [...]}`. Today's provider silently takes `text[0]`.
+
+| Option | Rule | Trade-off |
+|---|---|---|
+| `first` | `text[0]` | Status quo; arbitrary, and the ordering is not documented upstream |
+| **`highest_score`** | `text[argmax(score)]` | Uses the signal the dataset provides; a higher-quality, better-motivated target |
+
+*Recommendation (chosen):* `highest_score`. Exposed as `row_adapter_options.list_target_pick`,
+set explicitly in config so the choice is never hidden in code.
+
+---
+
+## D-016 — Sub-corpus sampling policy under a volume cap
+
+**Status:** `RESOLVED` — 2026-09-22. Chosen: **`shuffled_buffer`**
+(`data.sampling: shuffled_buffer`), for every tier including `local_smoke`.
+
+**Decided by:** the user, on 2026-09-22, relayed by the coordinating orchestrator agent — same
+provenance caveat as D-006/D-015.
+
+**Two conditions the choice imposes**, both now part of the contract:
+
+1. `data.shuffle_buffer_size` must be set explicitly (still **no default**) and must be
+   `≥ max(train_pool, test)` for the task, or the shuffle window is smaller than the sample and
+   the shuffle does nothing. It is logged in `config_used.json` and in every snapshot manifest,
+   because the buffer size determines how near-random the sample actually is.
+2. The shuffle seed is derived deterministically from `data.seed` and must be **identical across
+   both loads of the same task**. `skip`-based TEST carving from a single-split corpus (`instr`,
+   invariant `I2.6`) is a disjointness guarantee only if the two streams are shuffled into the
+   same order; a per-call random seed would silently break it. `assert_disjoint` remains the
+   independent check.
+
+The alternatives considered, retained for the record:
+
+`idea.md` §0.2 gives `actual` volumes as ranges and brief §4 forbids blindly processing entire
+datasets, so every load is capped. Neither source says **which** rows the cap selects. The
+existing provider streams and stops, i.e. it takes the *head* of the file — a systematically
+non-random sample (CNN/DailyMail is date-ordered; SQuAD is grouped by article title).
+
+| Option | Mechanism | Trade-off |
+|---|---|---|
+| `head_of_stream` | stream and stop | Cheapest; status quo. Biased in any corpus with meaningful row order — not defensible for a reported number |
+| **`shuffled_buffer`** | `IterableDataset.shuffle(buffer_size)` then take | Near-random at bounded memory; the buffer size is itself a knob and must be logged |
+| `full_then_seeded_subsample` | download the corpus, then sample with the run seed | Unbiased, but downloads whole corpora — directly against brief §4 |
+
+*Recommendation (chosen):* `shuffled_buffer`. Implemented as `data.sampling` with **no default**
+at base level plus `data.shuffle_buffer_size`, so a run that omits either still fails loudly —
+resolving the decision supplies the value, it does not remove the guard.
+`head_of_stream` stays implemented and selectable, but is no longer used by any configured arm.
 
 ---
 
@@ -359,7 +477,7 @@ count reduction bought by performance loss is visible.
 | D-003 | 3-way vs 2-way decision | **OPEN** | **research question scope** |
 | D-004 | top-k fusion | PROVISIONAL | — |
 | D-005 | τ_u selection source | **OPEN** | leakage validity |
-| D-006 | dataset pinning (B1 FLAN, B2 ELI5) | **OPEN** | **real data runs** |
+| D-006 | dataset pinning (B1 → dolly-15k, B2 → Pavithree/eli5) | RESOLVED 2026-09-22 (relayed attribution — see entry) | — |
 | D-007 | LoRM / FedALoRA / FedZKD citations | **OPEN** | baseline completeness |
 | D-008 | QLoRA needs CUDA | RESOLVED | local `actual` runs |
 | D-009 | primary_score not "accuracy" | PROVISIONAL | — |
@@ -368,3 +486,5 @@ count reduction bought by performance loss is visible.
 | D-012 | seeds / significance | **OPEN** | any claimed gain |
 | D-013 | fused-adapter storage | PROVISIONAL | — |
 | D-014 | adapter-count accounting | **OPEN** | efficiency claim |
+| D-015 | row→example adaptation (a `dialog_last_turn`, b `finqa_pre_table_post`/markdown, c `highest_score`) | RESOLVED 2026-09-22 (relayed attribution — see entry) | — |
+| D-016 | sub-corpus sampling (`shuffled_buffer`) | RESOLVED 2026-09-22 (relayed attribution — see entry) | — |

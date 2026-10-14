@@ -54,6 +54,36 @@ def test_run_mode_overlay_applied(cfg):
     assert cfg.get("training.max_steps") == 2
 
 
+def test_backbone_revision_is_part_of_the_recorded_identity(cfg):
+    """FR-1.1: a checkpoint's identity is (model_id, revision); both must be recorded."""
+    payload = cfg.to_config_used()
+    assert "revision" in payload["backbone"]
+    # The dummy tier builds its backbone in-process, so there is no upstream commit to pin.
+    assert payload["backbone"]["revision"] is None
+    assert BACKBONE_REGISTRY[RunMode.DUMMY].revision is None
+
+
+def test_model_revision_override_is_honoured_and_recorded(raw_config):
+    """FR-1.2: an explicit model.revision must reach BackboneSpec, loudly."""
+    fake_sha = "0" * 40
+    tree = dict(raw_config)
+    tree["model"] = {**tree["model"], "revision": fake_sha}
+    cfg = resolve(tree, run_mode="dummy", experiment_id="revision-override")
+    assert cfg.backbone.revision == fake_sha
+    assert fake_sha in cfg.backbone.notes          # overrides are never silent
+    assert cfg.to_config_used()["backbone"]["revision"] == fake_sha
+
+
+def test_local_smoke_registry_revision_matches_the_downloaded_snapshot():
+    """FR-1.1/FR-1.4: whatever is pinned must be a 40-hex commit sha, never a branch name."""
+    import re
+
+    pinned = BACKBONE_REGISTRY[RunMode.LOCAL_SMOKE].revision
+    if pinned is None:
+        pytest.skip("local_smoke checkpoint not yet fetched on this host (T-04)")
+    assert re.fullmatch(r"[0-9a-f]{40}", pinned), pinned
+
+
 def test_config_used_records_provenance(cfg):
     payload = cfg.to_config_used()
     assert payload["run_mode"] == "dummy"

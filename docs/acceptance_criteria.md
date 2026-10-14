@@ -30,6 +30,13 @@ Legend: `[x]` verified by the listed command · `[~]` implemented, verification 
 | B3 | `[x]` Manager cannot obtain a TEST handle | `pytest tests/test_split_isolation.py -k guard` |
 | B4 | `[x]` Split assignment deterministic in `(task, example_hash, seed)` | `pytest tests/test_split_isolation.py -k determinism` |
 | B5 | `[x]` Unpinned datasets fail loudly, never guess | `pytest tests/test_data_registry.py -k unpinned` |
+| B6 | `[ ]` Every dataset pinned to a **specific revision** (40-hex sha or a recorded `refs/convert/parquet`) | `pytest tests/test_data_registry.py -k revision_is_pinned` |
+| B7 | `[ ]` TEST carved disjointly from a single-split corpus; the unfixed path provably leaks | `pytest tests/test_single_split_carving.py` |
+| B8 | `[ ]` Volume caps and sampling policy come from config with no code default | `pytest tests/test_experiment_preconditions.py -k volumes_required` |
+| B9 | `[ ]` Real-data splits reproducible offline from the local snapshot cache | `HF_HUB_OFFLINE=1 python scripts/prepare_data.py --config configs/experiments/main_bootstrap.yaml --run-mode local_smoke` → all `snapshots[*].source == "local"`, identical `split_counts` |
+| B10 | `[ ]` Row→example rules named in config (D-015 values), unset fails loudly | `pytest tests/test_row_adapters.py` |
+| B11 | `[ ]` Shuffle-before-skip with a derived seed keeps single-split carving valid | `pytest tests/test_single_split_carving.py -k order` |
+| B12 | `[ ]` All six curriculum tasks produce four-way splits on real data | `python scripts/prepare_data.py --config configs/experiments/main_bootstrap.yaml --run-mode local_smoke` → `blocked_tasks == {}`, six entries in `available_tasks` |
 
 ## C. Model and adapters
 
@@ -121,7 +128,8 @@ Legend: `[x]` verified by the listed command · `[~]` implemented, verification 
 | I4 | `[x]` Resolved config hashing is stable | `pytest tests/test_config.py -k hash` |
 | I5 | `[x]` Quantisation unavailability raises, never silently downgrades | `pytest tests/test_config.py -k quantization` |
 | I6 | `[x]` Smoke test passes end to end on `dummy` | `python scripts/run_smoke.py --run-mode dummy` |
-| I7 | `[~]` Smoke test passes on `local_smoke` | `python scripts/run_smoke.py --run-mode local_smoke` — **blocked: requires downloading Qwen2.5-1.5B-Instruct (~3 GB)** |
+| I7 | `[~]` Smoke test passes on `local_smoke` | `python scripts/run_smoke.py --run-mode local_smoke` — **blocked: requires downloading Qwen2.5-1.5B-Instruct (~3 GB). Unblocked by `specs/local-smoke-data-bootstrap/`; `scripts/fetch_backbone.py --run-mode local_smoke` is the prerequisite step.** |
+| I9 | `[ ]` `local_smoke` backbone loads from a pinned local snapshot with the network disabled | `python scripts/fetch_backbone.py --config configs/experiments/main_bootstrap.yaml --run-mode local_smoke` → `backbone_cache.json.verified_offline_load == true` |
 | I8 | `[ ]` Reportable run reproducible from `config_used.json` alone | `python scripts/reproduce.py <results_dir>` — **blocked: no `actual` run has been executed (needs CUDA host, D-008)** |
 
 ## J. Review gate

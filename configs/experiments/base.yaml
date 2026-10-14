@@ -57,8 +57,46 @@ run_mode_overrides:
         max_eval_examples: 4
   local_smoke:
     data:
-      provider: synthetic     # switch to huggingface once D-006 B1/B2 are resolved
+      # Real data on a real (small) backbone: this tier is what proves the download -> pinned
+      # revision -> row adaptation -> four-way split -> leakage-audit path end to end before any
+      # `actual` run (docs/experiment_protocol.md S1 precondition 2). Still NON-REPORTABLE.
+      provider: huggingface
       smoke_max_examples_per_split: 32
+      # >= max(train_pool, test) for every task below (FR-3.7); recorded in config_used.json and
+      # in every snapshot manifest because it determines how near-random the sample is.
+      shuffle_buffer_size: 1024
+      # train_pool >= cap / min(split_ratios) = 32 / 0.15 = 214, taken to 400 so hash-bucket
+      # variation cannot leave a split short of the cap; test >= cap = 32, taken to 64.
+      volumes:
+        sum:
+          train_pool: 400
+          test: 64
+          test_split: validation
+        qa:
+          train_pool: 400
+          test: 64
+          test_split: validation
+        instr:
+          # dolly-15k has ONE split (train, 15 011 rows), so TEST is an offset window of it.
+          # test_offset must be >= the rows the training pool actually consumed (enforced against
+          # the measured count in prepare_data, FR-4.4) and
+          # train_pool + test_offset + test <= 15 011 (EC-7).
+          train_pool: 400
+          test: 64
+          test_split: train
+          test_offset: 500
+        dialog:
+          train_pool: 400
+          test: 64
+          test_split: validation
+        longform:
+          train_pool: 400
+          test: 64
+          test_split: validation
+        domain:
+          train_pool: 400
+          test: 64
+          test_split: test
     training:
       max_steps: 10
     fusion:

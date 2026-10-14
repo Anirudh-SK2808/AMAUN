@@ -59,6 +59,17 @@ class UnpinnedDatasetError(DataError):
     """A dataset has no pinned identity/revision (D-006).  Guessing one is forbidden."""
 
 
+class UnresolvedRowAdapterError(DataError):
+    """A task's row->example rule is unset or unknown (D-015).
+
+    Upstream rows and the task's prompt contract do not always line up (DailyDialog has
+    ``dialog``, not ``history``; FinQA has no ``context``; ELI5's target is a *list* of answers).
+    Which rule maps a row to an example changes **what the adapter learns**, so it is named per
+    task in ``configs/datasets/`` with no code default: an unset or misspelled name raises here
+    rather than being guessed at.
+    """
+
+
 class SplitAccessViolation(DataError):
     """A component read a split it is not permitted to read (leakage guard)."""
 

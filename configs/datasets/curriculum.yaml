@@ -1,9 +1,16 @@
 # Task curriculum -- idea.md S0.2, implemented as an extensible config-driven list.
 # Adding a task requires no code change (idea.md S0.2 note 4).
 #
-# LICENSING AND PINNING: see docs/decision_register.md D-006.
-# Two rows are deliberately unpinned; the loader raises UnpinnedDatasetError rather than
-# guessing, because the choice changes what the adapter represents.
+# LICENSING AND PINNING: see docs/decision_register.md D-006 (RESOLVED 2026-09-22).
+# Every revision below is a 40-hex commit sha resolved from the live Hub on 2026-09-22, or the
+# literal `refs/convert/parquet` pinned together with that ref's resolved commit -- "pinned" in
+# this repo means a specific revision, never a floating branch (FR-2.1/FR-2.8).
+#
+# ROW ADAPTATION: see docs/decision_register.md D-015 (RESOLVED 2026-09-22). Each task names the
+# rule mapping an upstream row to (prompt fields, target). There is NO code default: an unset or
+# unknown name raises UnresolvedRowAdapterError and the task is skipped and reported.
+#
+# SAMPLING: see docs/decision_register.md D-016 (RESOLVED 2026-09-22).
 
 data:
   provider: synthetic        # huggingface | synthetic. synthetic is offline, for tests/dummy.
@@ -16,6 +23,20 @@ data:
   smoke_max_examples_per_split: 32   # idea.md S0.2.1: defined ONCE, referenced everywhere
   synthetic_pool_size: 256
   synthetic_test_size: 64
+  # D-016: which rows a volume cap selects. `head_of_stream` stays implemented and selectable but
+  # is used by no configured arm; it is systematically biased in any corpus with meaningful row
+  # order (CNN/DailyMail is date-ordered, SQuAD is grouped by article).
+  sampling: shuffled_buffer
+  # Must be >= max(train_pool, test) per task, or the shuffle window is narrower than the sample
+  # and the shuffle is a no-op (FR-3.7 / EC-14). null at base level: it is only meaningful
+  # alongside a volumes block, and `actual` volumes are unresolved.
+  shuffle_buffer_size: null
+  # Bounded, content-keyed on-disk cache of the capped sample, so run 2 needs no network (FR-5).
+  offline_snapshots: true
+  # Per-task {train_pool, test, test_split[, test_offset]}. NO default: how many examples a task
+  # trains on and which upstream split becomes TEST are experiment-affecting (M0). Unresolved for
+  # `actual` -- idea.md S0.2 gives ranges, not values -- so an `actual` run fails loudly here.
+  volumes: null
 
 datasets:
   order: [sum, qa, instr, dialog, longform, domain]
@@ -26,7 +47,9 @@ datasets:
       task_type: summarization
       description: "Abstractive news summarization (idea.md S0.2 LoRA-1)."
       hf_id: abisee/cnn_dailymail
-      hf_revision: "3.0.0"
+      # NOTE: "3.0.0" is the *config name*, not a git ref -- the repo has only main/script
+      # branches, so the previous `hf_revision: "3.0.0"` could never resolve.
+      hf_revision: 96df5e686bee6baa90b8bee7c28b81fa3fa6223d
       hf_config: "3.0.0"
       license: "Apache-2.0 (dataset scripts); news articles under fair-use research terms"
       license_notes: "Re-verify at download time. Redistribution of article text is restricted."
@@ -39,13 +62,16 @@ datasets:
       max_target_tokens: 128
       upstream_test_source: "upstream 'validation' split (upstream 'test' reserved, unused)"
       actual_volume_note: "30k-50k train per idea.md S0.2; exact value recorded in config_used.json"
+      row_adapter: passthrough          # upstream column names are the template slots
+      row_adapter_options:
+        list_target_pick: first         # `highlights` is a plain string; documents prior behaviour
 
     qa:
       task_name: Question Answering
       task_type: question_answering
       description: "Extractive QA (idea.md S0.2 LoRA-2)."
       hf_id: rajpurkar/squad
-      hf_revision: null
+      hf_revision: 7b6d24c440a36b6815f21b70d25016731768db1f
       hf_config: plain_text
       license: "CC BY-SA 4.0"
       license_notes: "Share-alike applies to derivatives."
@@ -57,37 +83,53 @@ datasets:
       max_input_tokens: 512
       max_target_tokens: 48
       upstream_test_source: "upstream 'validation' split (SQuAD test labels are not public)"
+      row_adapter: passthrough
+      row_adapter_options:
+        # SQuAD's `answers` is {text: [...], answer_start: [...]} with no score signal; `first`
+        # reproduces the pre-change provider exactly rather than introducing a choice (FR-6.3).
+        list_target_pick: first
 
     instr:
       task_name: Instruction Following
       task_type: instruction_following
-      description: "FLAN-style instruction following (idea.md S0.2 LoRA-3)."
-      hf_id: null              # BLOCKER D-006 B1
-      hf_revision: null
+      description: "Human-authored instruction following over databricks-dolly-15k (idea.md S0.2 LoRA-3)."
+      # D-006 B1 RESOLVED: dolly-15k, NOT a FLAN mixture. The paper must say "15k human-authored
+      # instructions", never "FLAN-style".
+      hf_id: databricks/databricks-dolly-15k
+      hf_revision: bdd27f4d94b9c1f951818a7da7fd7aeea5dbff1a
       hf_config: null
-      pinned: false
-      unpinned_reason: >-
-        '"FLAN-style" is not a dataset. Candidates differ substantially in mixture
-        composition, which changes what this adapter is. Candidates: Muennighoff/flan,
-        SirNeural/flan_v2, databricks/databricks-dolly-15k (CC BY-SA 3.0).
-        See docs/decision_register.md D-006 B1.'
-      license: UNPINNED
-      license_notes: "Depends on the chosen mixture."
+      pinned: true
+      license: "CC BY-SA 3.0"
+      license_notes: >-
+        'Share-alike propagates to derivatives, including adapters trained on it; this must be
+        stated in any release. Real schema is instruction/context/response/category -- `context`
+        is EMPTY for a large share of rows, which is valid input, not a missing field.'
       primary_score: rougeL
       metrics: [rougeL, bertscore_f1]
-      input_fields: [instruction, input]
-      target_field: output
-      prompt_template: "{instruction}\n\n{input}\n\nResponse:"
+      input_fields: [instruction, context]
+      target_field: response
+      prompt_template: "{instruction}\n\n{context}\n\nResponse:"
       max_input_tokens: 512
       max_target_tokens: 256
-      upstream_test_source: UNPINNED
+      # Dolly has exactly ONE upstream split (train, 15 011 rows), so TEST is carved from a
+      # row-offset window of it: see data.volumes.instr.test_offset and design.md S4.
+      upstream_test_source: >-
+        'offset-carved window of upstream "train" (the only split): rows [test_offset,
+        test_offset + test) of the seeded shuffled stream, disjoint from the training pool window'
+      row_adapter: passthrough
+      row_adapter_options:
+        list_target_pick: first         # `response` is a plain string
 
     dialog:
       task_name: Dialogue Generation
       task_type: dialogue
       description: "Open-domain multi-turn dialogue (idea.md S0.2 LoRA-4)."
       hf_id: li2017dailydialog/daily_dialog
-      hf_revision: null
+      # `main` holds ONLY a loading script (daily_dialog.py) and datasets >= 4 removed script
+      # execution, so the dataset is pinned to its automatic parquet conversion. That is the same
+      # dataset, mechanically converted -- substituting a mirror repo would change its identity.
+      hf_revision: refs/convert/parquet
+      hf_revision_resolved: 469b7118f52336674f1d78693797e9fcc7e47d2a
       hf_config: null
       license: "CC BY-NC-SA 4.0"
       license_notes: "NON-COMMERCIAL only. Research use is permitted; must be stated in any release."
@@ -98,41 +140,56 @@ datasets:
       prompt_template: "Continue the conversation naturally.\n\n{history}\n\nResponse:"
       max_input_tokens: 512
       max_target_tokens: 128
-      upstream_test_source: "upstream 'validation' split"
+      upstream_test_source: "upstream 'validation' split (1 000 dialogues)"
+      # D-015 (a): one example per dialogue (~11k train), not one per turn prefix. The rejected
+      # `dialog_all_prefixes` stays implemented and unselected.
+      row_adapter: dialog_last_turn
+      row_adapter_options:
+        separator: " | "                # matches the synthetic provider's dialogue-history shape
+      row_adapter_reason: "D-015 (a): history = utterances[:-1], target = utterances[-1]"
 
     longform:
       task_name: Long-form Generation
       task_type: long_form_generation
-      description: "Long-form explanatory answers (idea.md S0.2 LoRA-5)."
-      hf_id: null              # BLOCKER D-006 B2
-      hf_revision: null
+      description: "Long-form explanatory answers over an ELI5 mirror (idea.md S0.2 LoRA-5)."
+      # D-006 B2 RESOLVED: Pavithree/eli5, a community mirror with train/validation/test splits.
+      hf_id: Pavithree/eli5
+      hf_revision: 15e4d1933a321088880215257aa25b621a091335
       hf_config: null
-      pinned: false
-      unpinned_reason: >-
-        'The original ELI5 HF dataset was withdrawn over Reddit API/licensing terms and is
-        not reliably loadable. Candidates: eli5_category, KILT-ELI5, or a different long-form
-        corpus -- but substituting changes what "long-form generation" means in the paper.
-        See docs/decision_register.md D-006 B2.'
-      license: UNPINNED
-      license_notes: "Reddit-derived content has redistribution restrictions."
+      pinned: true
+      license: "NONE DECLARED ON MIRROR (Reddit-derived content)"
+      license_notes: >-
+        'The mirror declares NO license and the content is Reddit-derived, so redistribution is
+        restricted; this is a residual publication risk that a data statement must disclose. It is
+        NOT MIT and NOT merely "unknown" -- the absence of a declared license is the finding.'
       primary_score: rougeL
       metrics: [rougeL, perplexity]
-      input_fields: [question]
-      target_field: answer
-      prompt_template: "Explain in detail.\n\nQuestion: {question}\n\nExplanation:"
+      input_fields: [title]
+      target_field: answers
+      prompt_template: "Explain in detail.\n\nQuestion: {title}\n\nExplanation:"
       max_input_tokens: 256
       max_target_tokens: 512
-      upstream_test_source: UNPINNED
+      upstream_test_source: "upstream 'validation' split (3 020 rows)"
+      row_adapter: passthrough
+      row_adapter_options:
+        # D-015 (c): the target is answers.text[argmax(score)], NOT text[0]. Any earlier
+        # synthetic-data run is not comparable at the target level.
+        list_target_pick: highest_score
+      row_adapter_reason: "D-015 (c): highest-scored ELI5 answer is the target"
 
     domain:
       task_name: Domain-specific Generation
       task_type: domain_generation
-      description: "Financial reasoning/generation (idea.md S0.2 LoRA-6)."
+      description: "Financial reasoning/generation over FinQA (idea.md S0.2 LoRA-6)."
       hf_id: dreamerdeo/finqa
-      hf_revision: null
+      # As with `dialog`, `main` holds only a loading script (finqa.py) that datasets 5.x cannot
+      # execute (verified 2026-09-22: RuntimeError "Dataset scripts are no longer supported"), so
+      # the same FR-2.6 mechanism applies -- pinned to the parquet conversion plus its commit.
+      hf_revision: refs/convert/parquet
+      hf_revision_resolved: 50a82979fa410ff5efc29e2c14d9aa43d3877666
       hf_config: null
       license: "MIT (per source repository)"
-      license_notes: "Re-verify at download time."
+      license_notes: "Re-verified 2026-09-22. No `context` column upstream; see D-015 (b)."
       primary_score: token_f1
       metrics: [exact_match, token_f1, rougeL]
       input_fields: [context, question]
@@ -141,3 +198,11 @@ datasets:
       max_input_tokens: 768
       max_target_tokens: 128
       upstream_test_source: "upstream 'test' split"
+      # D-015 (b): context = pre_text + markdown-serialised table + post_text, FinQA's original
+      # input. Contexts are long against max_input_tokens, so the over-length fraction is measured
+      # into the snapshot manifest rather than assumed. The rejected `finqa_text_only` stays
+      # implemented and unselected.
+      row_adapter: finqa_pre_table_post
+      row_adapter_options:
+        table_format: markdown
+      row_adapter_reason: "D-015 (b): pre_text + markdown table + post_text"

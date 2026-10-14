@@ -52,6 +52,14 @@ class TaskSpec:
     upstream_test_source: str   # documents which upstream split becomes our TEST (protocol S2)
     pinned: bool = True
     unpinned_reason: str | None = None
+    # Set when hf_revision is a symbolic ref (e.g. refs/convert/parquet): the commit that ref
+    # pointed at when the task was pinned, so a silent upstream re-conversion is detectable.
+    hf_revision_resolved: str | None = None
+    # D-015: the named row->example rule and its options.  No code default; an unset value
+    # raises UnresolvedRowAdapterError via amaun.data.row_adapters.resolve().
+    row_adapter: str | None = None
+    row_adapter_options: dict[str, Any] = field(default_factory=dict)
+    row_adapter_reason: str = ""
 
     def require_pinned(self) -> None:
         if not self.pinned or self.hf_id is None:
@@ -97,6 +105,10 @@ def task_spec_from_config(task_id: str, section: dict[str, Any]) -> TaskSpec:
         upstream_test_source=str(section.get("upstream_test_source", "UNDOCUMENTED")),
         pinned=bool(hf_id) and bool(section.get("pinned", True)),
         unpinned_reason=section.get("unpinned_reason"),
+        hf_revision_resolved=section.get("hf_revision_resolved"),
+        row_adapter=section.get("row_adapter"),
+        row_adapter_options=dict(section.get("row_adapter_options") or {}),
+        row_adapter_reason=str(section.get("row_adapter_reason", "")),
     )
 
 
