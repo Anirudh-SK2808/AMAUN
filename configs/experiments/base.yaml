@@ -99,5 +99,21 @@ run_mode_overrides:
           test_split: test
     training:
       max_steps: 10
+      # MPS (Apple Silicon unified memory) retains/fragments activation memory far more than
+      # CUDA; a 1.5B model at batch_size=4 OOM'd on a 24GB M-series host on the very first
+      # forward pass. batch_size=1 + gradient_accumulation_steps=4 keeps the same effective
+      # batch of 4; gradient_checkpointing trades recompute for the large activation-memory win.
+      batch_size: 1
+      gradient_accumulation_steps: 4
+      gradient_checkpointing: true
     fusion:
       steps: 5
+    features:
+      performance:
+        # _validation_loss (manager/bootstrap.py) collates ALL max_eval_examples into a single
+        # un-batched forward pass -- unlike training, it does not respect training.batch_size.
+        # The default of 32 examples at ~900 tokens tried to allocate a single ~9.5GB logits
+        # tensor (seq * vocab_size in fp32) and OOM'd on MPS on top of the ~22GB already
+        # resident from the six sequential adapter trainings. 8 keeps this path's memory small
+        # without starving the utility-bootstrap proxy signal of examples.
+        max_eval_examples: 8

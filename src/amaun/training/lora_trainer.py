@@ -349,6 +349,14 @@ def train_adapter(
         budget.wall_seconds += record.wall_seconds
         budget.trainable_parameters = max(budget.trainable_parameters, record.trainable_parameters)
 
+    # MPS's caching allocator does not return freed blocks to the OS on its own, so repeated
+    # train_adapter calls in the same process (bootstrap_repository trains 6+ in sequence)
+    # accumulate a rising memory high-water-mark even though each adapter's optimiser state is
+    # unreachable after this function returns. Drop the reference and reclaim explicitly.
+    del optimizer
+    if device == "mps":
+        torch.mps.empty_cache()
+
     log.info(
         "[%s] done: %d steps, final loss %s, %.1fs, backbone unchanged",
         adapter_id, record.steps, f"{record.final_train_loss:.4f}" if record.final_train_loss else "n/a",

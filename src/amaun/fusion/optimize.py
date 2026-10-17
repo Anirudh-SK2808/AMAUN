@@ -228,6 +228,14 @@ def run_fusion_kd(
     record.sources_verified_unmutated = True
     record.wall_seconds = time.perf_counter() - start
 
+    # Same MPS fragmentation issue as lora_trainer.train_adapter: a fresh optimiser per fusion
+    # call, never explicitly released, left the caching allocator's high-water-mark climbing
+    # across calls (observed: 480s -> 1059s on the second call alone). Drop it and reclaim.
+    if "optimizer" in locals():
+        del optimizer
+    if device == "mps":
+        torch.mps.empty_cache()
+
     log.info(
         "fused %s from %s in %d steps (%.1fs); mean alpha %s",
         fused_adapter_id, record.component_ids, record.steps, record.wall_seconds,

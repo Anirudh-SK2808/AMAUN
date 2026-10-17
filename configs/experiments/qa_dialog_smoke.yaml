@@ -1,0 +1,15 @@
+# Minimal wiring-check arm: same mechanism as main_bootstrap (bootstrap_six), but with only 2
+# seed tasks instead of 6. The utility bootstrap's cost is O(repository_size x dev_tasks)
+# full fusion+KD proxy runs (D-010) -- 6 seed tasks x 2 dev tasks forced ~10 of those on a
+# laptop GPU. 2 seed tasks x 1 dev task needs exactly 1. This is NOT a scientific configuration
+# (same A-14 placeholder-stream caveat as main_bootstrap) -- it exists purely to prove the
+# REUSE/FUSE/CREATE + utility-network machinery runs correctly on real weights, cheaply.
+includes:
+  - experiments/base.yaml
+
+experiment_id: qa_dialog_smoke
+
+curriculum:
+  repository_init: bootstrap_six
+  seed_tasks: [qa, dialog]
+  evaluated_stream: [qa, dialog]
