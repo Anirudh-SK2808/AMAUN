@@ -1,6 +1,6 @@
 # AMAUN pinned environment.
 # Recorded in provenance.json on every run; these are the versions this codebase was
-# developed and tested against (Python 3.11.15, macOS arm64).
+# developed and tested against (Python 3.11.15, macOS arm64; Python 3.11.17, Linux x86_64 + CUDA 13.0).
 #
 # QLoRA (`actual` tier) additionally needs bitsandbytes, which requires CUDA and therefore
 # cannot be installed usefully on Apple Silicon -- see docs/decision_register.md D-008.
@@ -8,12 +8,12 @@
 torch==2.14.0
 transformers==5.17.0
 peft==0.21.0
-datasets==4.5.1
+datasets==5.0.1
 numpy==2.4.6
 pyyaml==6.0.3
-safetensors==0.7.0
-accelerate==1.13.1
-scipy==1.16.3
+safetensors==0.8.0
+accelerate==1.15.0
+scipy==1.17.1
 psutil==7.2.2              # CPU RSS in amaun.utils.resources (optional: /proc fallback on Linux)
 pytest==9.1.1
 
