@@ -59,7 +59,7 @@ The original brief mentioned "3 adapters across 2 initial tasks"; the assignment
 | Training | 1 epoch = 375 optimiser steps (batch 4 × accumulation 4), lr 2e-4 cosine, no early stop | `training.*` |
 | Input / target tokens | sum 512 / 128; domain 768 / 128 (input restored to the curriculum value); qa 512/48; sentiment 512/4; longform 256/512 | `datasets.tasks.*` |
 | Prompt truncation | `middle` for all five tasks (§6.1) | `datasets.tasks.*.prompt_truncation` |
-| Gradient checkpointing | off | `training.gradient_checkpointing` |
+| Gradient checkpointing | on for training (FinQA's longest batch does not fit without it, §6.3); fusion is not checkpointed | `training.gradient_checkpointing` |
 | Intermediate evaluation | 16 VALIDATION examples (loss every 125 steps; generation checks in supervision) | `training.intermediate_eval_examples`, `decision_study.supervision_generation_examples` |
 | Final evaluation | 150 TEST examples per (adapter, task) | `evaluation.max_test_examples` |
 | Fusion | layer-wise softmax α (init 0.5), 100 steps, KD λ 1, T 2, 16 retention examples from TRAIN | `fusion.*`, `kd.*` |
@@ -235,6 +235,10 @@ final evaluation), followed by a repeated-cycle measurement on the dummy tier.
 | Trainer kept `logits`, optimiser, scheduler and parameter list alive to function end | delayed release | explicit `del`; before/after snapshots in `TrainingRecord.memory` | n/a |
 | FUSE built `list(loader)[:steps]` | tokenised all ~1 500 TRAIN batches to use 100 | `itertools.islice` (runner and study) | yes, same batches |
 | `evaluate_loss` / `_validation_loss` used `no_grad` | autograd version-counter overhead | `torch.inference_mode()` | yes |
+| `FusedLoRALinear` scaled the `d_out`-wide term by α, so backward saved an fp32 `[B, S, d_out]` tensor per component per module | fusion+KD step out of memory at batch 4 on every task (L4) | scale the rank-r intermediate instead | yes, test-pinned (`tests/test_fusion_memory.py`) |
+| Fusion kept the task graph alive through the KD retention forward | both graphs resident in one step | one backward per loss term (`backward_fusion_losses`) | yes (same summed gradient), test-pinned |
+| Preflight chose its worst case by characters, not tokens | checked FinQA at 774 tokens; TRAIN reaches 884, which ran out of memory in training | `worst_case_examples` by token count after truncation | n/a, test-pinned (`tests/test_decision_study_preflight.py`) |
+| Preflight never applied `training.gradient_checkpointing` | could not check that setting | train_step check enables it as `train_adapter` does | n/a, test-pinned |
 
 **Checked, no problem found**
 
@@ -261,38 +265,67 @@ allocator caching, not a leak.
 `torch.cuda.empty_cache()` is called only inside `cleanup(release_cache=True)` after an OOM in
 preflight. Cleanup otherwise relies on dropping references and `gc.collect()`.
 
-### 6.3 Batch size 4 without gradient checkpointing
+### 6.3 Batch size 4 on the L4 (measured)
 
-This was not verified on an L4. Phase 0 runs, per task, the longest TRAIN examples through one
-LoRA forward+backward at batch 4, one fusion+KD step, and one 128-token generation. On OOM it
-writes the exact error and the smallest adjustment to `decision_study/preflight.json`:
-`batch_size: 2` with `gradient_accumulation_steps: 8`, which keeps the effective batch of 16,
-then gradient checkpointing. The script exits with status 3 and **does not change any setting
-itself**.
+Measured on the L4 on 2026-10-22 (`results/local_smoke/l4_time_estimate/`). The preflight runs, per
+task, the longest TRAIN batch **by token count** through one training step, one fusion+KD step,
+and one generation from the longest prompt. On out-of-memory it writes the error and a per-check
+adjustment to `decision_study/preflight.json`, exits with status 3, and changes nothing itself.
 
-Rough expectation, unverified: bf16 weights ~3.1 GB. Activations for batch 4 at the longest
-sequence (FinQA: 768 + 128 = 896 tokens; ELI5 256 + 512 = 768) are of order 10–12 GB. The
-response-only loss keeps the fp32 loss tensor to response positions. That should leave headroom
-in 24 GB, and FinQA is now the case most likely to fail.
+Training step at batch 4 on the token-longest rows, peak allocated GiB (usable: 22.0):
+
+| Task (tokens) | No checkpointing | Checkpointing (configured) |
+|---|---|---|
+| sum (641) | 16.2 | 5.4 |
+| qa (522) | 14.1 | 4.9 |
+| sentiment (514) | 13.6 | 4.9 |
+| longform (621) | 18.2 | 7.4 |
+| domain / FinQA (884) | out of memory (also with `expandable_segments`) | 6.3 |
+
+Fusion+KD step (not checkpointed) after the §6.2 fix: sum 15.2, qa 13.3, sentiment 12.8,
+longform 17.3, **FinQA 20.4 GiB allocated, 21.8 reserved**. FinQA fusion fits with little margin.
+The preflight's retention batch is the same 884-token rows; in the run, retention comes from the
+old adapter's task (at most 641 tokens), so the run's peak is at or below this. Launching with
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` reduces fragmentation and changes no value.
 
 ## 7. Does it fit in 12 hours?
 
-**Unknown until measured.** Work counts are exact; throughputs are assumptions.
+**Projected 7.8 h; 12.7 h if every generation runs to its cap.** Measured on the L4 by
+`scripts/estimate_decision_study_time.py` (2026-10-22, commit `bb73604`, checkpointing on), which
+times the study's own code paths and multiplies by its work counts. It reads no TEST data.
 
 | Work | Count |
 |---|---|
 | LoRA trainings | 5 × 375 steps (1 500 micro-batches each) |
 | Fusion + KD runs | 6 supervision + 6 evaluation, 100 steps each (+ preflight and audit) |
-| TEST evaluations (150 examples, greedy, ≤128 new tokens) | 3 standalone + 5 zero-shot + 20 option evaluations = 28 |
-| VALIDATION generation checks (16 examples) | 18 |
+| TEST evaluations (150 examples, greedy, one example at a time) | 3 standalone + 5 zero-shot + 20 option evaluations = 28 |
+| VALIDATION loss passes (750 examples) / generation checks (16 examples) | 21 / 15 |
 
-Assuming 0.4–0.8 s per training micro-batch and 20–35 ms per generated token on the L4 gives
-roughly 3.5–6 h, so the configuration is expected to fit. Neither throughput figure has been
-measured. The run records per-phase durations in `summary.json` (`durations_seconds`,
-`total_wall_seconds`, `fits_time_budget`). If the 12 h budget is reached, remaining items are
-skipped and listed under `skipped`. Each item is checked before it starts, so the last one in
-progress can overrun slightly. The largest single lever is `evaluation.max_test_examples`: 100
-instead of 150 cuts about a third of evaluation time.
+Measured throughput: 0.73–2.0 s per training micro-batch (FinQA slowest), 0.9–1.9 s per fusion
+step, and **~75 ms per generated token** at batch 1 (2–4× the earlier assumption), plus ~0.08 s
+per prompt.
+
+| Phase | Expected (h) | All at cap (h) |
+|---|---|---|
+| Preflight | 0.03 | 0.03 |
+| Phase 1: train 3 adapters | 1.38 | 1.38 |
+| Phase 1: standalone + zero-shot TEST | 1.37 | 1.95 |
+| Phase 2: supervision (probes, fusion, loss, checks) | 0.73 | 0.92 |
+| Phase 3: ELI5 (train, fusion, 10 TEST evals) | 2.81 | 3.88 |
+| Phase 3: FinQA (train, fusion, 10 TEST evals) | 1.41 | 4.43 |
+| Phase 4: memory audit | 0.04 | 0.07 |
+| **Total** | **7.77** | **12.66** |
+
+"Expected" assumes trained adapters stop at the reference length (VALIDATION targets: sum 63,
+qa 6, sentiment 2, ELI5 95, FinQA 5 tokens) and zero-shot stops where the backbone stopped (sum
+119, ELI5 123, FinQA 98). The largest uncertainty is FinQA's three REUSE options: an adapter
+from another task may answer at length. At the zero-shot length they add ~0.9 h (≈ 8.6 h total).
+On the dummy tier the estimator came in 16% under the measured run (untimed per-call overhead),
+so read the projection as roughly 8–9 h.
+
+Generation is over half of the expected total. If the 12 h budget is reached, remaining items are
+skipped and listed in `summary.json`; phase 3 FinQA comes last. The largest lever is
+`evaluation.max_test_examples`: 100 instead of 150 cuts about a third of evaluation time.
 
 ## 8. Limitations
 
