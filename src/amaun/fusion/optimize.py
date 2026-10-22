@@ -77,6 +77,36 @@ class FusionRecord:
         return summary
 
 
+def backward_fusion_losses(
+    model: Any,
+    batch: TokenizedBatch,
+    retention: TokenizedBatch | None,
+    teacher_logits: torch.Tensor | None,
+    *,
+    kd_cfg: KDConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Accumulate the gradient of ``L_new + lambda * L_KD`` with one backward pass per term.
+
+    ``d(L_new + lambda L_KD) = dL_new + lambda dL_KD``, so two backward passes into the same
+    ``.grad`` give the joint gradient (up to floating-point summation order) -- but the task
+    graph is freed before the retention forward runs, so only one graph is alive at a time.
+    Returns both losses, detached.  ``L_KD`` is zero when there is no retention batch.
+    """
+    logits = model(input_ids=batch.input_ids, attention_mask=batch.attention_mask).logits
+    loss_new = masked_cross_entropy(logits, batch.labels)
+    loss_new.backward()
+    del logits
+    loss_kd = torch.zeros((), device=loss_new.device)
+    if retention is not None and teacher_logits is not None:
+        student_logits = model(
+            input_ids=retention.input_ids, attention_mask=retention.attention_mask
+        ).logits
+        loss_kd = kd_loss(student_logits, teacher_logits, retention.labels, temperature=kd_cfg.temperature)
+        (kd_cfg.lam * loss_kd).backward()
+        del student_logits
+    return loss_new.detach(), loss_kd.detach()
+
+
 def run_fusion_kd(
     *,
     backbone: Any,
@@ -156,25 +186,16 @@ def run_fusion_kd(
             batch = task_batches[(step - 1) % len(task_batches)].to(device)
             optimizer.zero_grad(set_to_none=True)
 
-            logits = base_model(input_ids=batch.input_ids, attention_mask=batch.attention_mask).logits
-            loss_new = masked_cross_entropy(logits, batch.labels)
-
-            loss_kd = torch.zeros((), device=loss_new.device)
+            retention = teacher_logits = None
             if teacher is not None and kd_cfg.lam != 0.0:
                 index = (step - 1) % len(teacher.batches)
                 retention = teacher.batches[index].to(device)
-                student_logits = base_model(
-                    input_ids=retention.input_ids, attention_mask=retention.attention_mask
-                ).logits
-                loss_kd = kd_loss(
-                    student_logits,
-                    teacher.logits[index],
-                    retention.labels,
-                    temperature=kd_cfg.temperature,
-                )
+                teacher_logits = teacher.logits[index]
+            loss_new, loss_kd = backward_fusion_losses(
+                base_model, batch, retention, teacher_logits, kd_cfg=kd_cfg,
+            )
 
             total = loss_new + kd_cfg.lam * loss_kd
-            total.backward()
             optimizer.step()
 
             if budget is not None:

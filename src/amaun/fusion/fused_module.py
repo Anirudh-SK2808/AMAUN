@@ -140,8 +140,12 @@ class FusedLoRALinear(nn.Module):
         delta = None
         for index in range(self.num_components):
             inner = torch.nn.functional.linear(x_work, self.component_A(index))
-            term = torch.nn.functional.linear(inner, self.component_B(index))
-            term = term * (coefficients[index] * self.scalings[index])
+            # The coefficient scales the rank-r intermediate, not the d_out-wide term: by
+            # linearity (c * h) @ B^T == c * (h @ B^T), but the multiply's backward then saves
+            # an [.., r] tensor instead of an [.., d_out] fp32 one per component.  At batch 4 x
+            # 640 tokens that difference is what made a fusion step exceed 22 GB on an L4.
+            scaled = inner * (coefficients[index] * self.scalings[index])
+            term = torch.nn.functional.linear(scaled, self.component_B(index))
             delta = term if delta is None else delta + term
         return out + delta.to(out.dtype)
 
