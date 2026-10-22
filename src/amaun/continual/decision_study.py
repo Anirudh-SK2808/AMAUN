@@ -51,9 +51,9 @@ from amaun.baselines.strategies import (
 from amaun.config import ResolvedConfig, RunMode
 from amaun.continual.runner import ContinualRunner
 from amaun.data.loaders import BatchPlan, GuardedLoader
-from amaun.data.preprocess import collate, masked_cross_entropy
+from amaun.data.preprocess import IGNORE_INDEX, collate, masked_cross_entropy, tokenize_example
 from amaun.data.registry import TaskSpec
-from amaun.data.splits import SplitName, TaskSplits, evaluator_guard, trainer_guard, utility_guard
+from amaun.data.splits import Example, SplitName, TaskSplits, evaluator_guard, trainer_guard, utility_guard
 from amaun.errors import PreconditionError
 from amaun.evaluation.evaluator import Evaluator
 from amaun.features.extractor import FeatureExtractor
@@ -70,7 +70,12 @@ from amaun.manager.reuse_gate import (
 from amaun.manager.targets import SupervisionExample, SupervisionSet, measure_outcome_targets
 from amaun.manager.threshold import select_thresholds
 from amaun.manager.utility_network import OUTCOME_HEADS
-from amaun.models.backbone import LoadedBackbone, _is_adapter_parameter, assert_fingerprint_unchanged
+from amaun.models.backbone import (
+    LoadedBackbone,
+    _is_adapter_parameter,
+    assert_backbone_frozen,
+    assert_fingerprint_unchanged,
+)
 from amaun.models.generation import GenerationConfig
 from amaun.training.lora_trainer import train_adapter
 from amaun.utils.logging import get_logger
@@ -216,6 +221,29 @@ class _Clock:
 
     def record(self, phase: str, seconds: float) -> None:
         self.phases[phase] = self.phases.get(phase, 0.0) + seconds
+
+
+
+def worst_case_examples(tokenizer: Any, task: TaskSpec, examples: Sequence[Example],
+                        count: int) -> tuple[list[Example], Example]:
+    """The ``count`` examples with the most tokens, and the one with the longest prompt.
+
+    Both are measured after the task's own truncation, i.e. on what a batch actually allocates.
+    Character length is not a proxy for that: ``middle`` truncation caps every long prompt at
+    ``max_input_tokens``, so the longest-by-characters rows can be shorter in tokens than rows
+    with a short prompt and a long target (FinQA: 774 vs 884 tokens at batch 4).  Ties keep
+    the split's order, so the selection is deterministic.
+    """
+    lengths = []
+    for example in examples:
+        input_ids, labels = tokenize_example(
+            tokenizer, example, max_input_tokens=task.max_input_tokens,
+            max_target_tokens=task.max_target_tokens, prompt_truncation=task.prompt_truncation,
+        )
+        lengths.append((len(input_ids), sum(1 for label in labels if label == IGNORE_INDEX)))
+    order = sorted(range(len(examples)), key=lambda i: lengths[i][0], reverse=True)
+    longest_prompt = max(range(len(examples)), key=lambda i: lengths[i][1])
+    return [examples[i] for i in order[:count]], examples[longest_prompt]
 
 
 # --------------------------------------------------------------------------------------
@@ -412,23 +440,37 @@ class DecisionStudy:
     def preflight(self) -> dict[str, Any]:
         """Worst-case memory at the configured batch size; report, never adjust.
 
-        Per task, on the longest TRAIN examples: one LoRA forward+backward at
-        ``training.batch_size``, one fusion+KD step (two freshly initialised deltas, so it runs
-        before any adapter exists), and one greedy generation of up to ``max_new_tokens``.
+        Per task, on the longest TRAIN examples by token count (:func:`worst_case_examples`):
+        one LoRA forward+backward at ``training.batch_size`` with ``training.gradient_checkpointing``
+        applied as ``train_adapter`` applies it, one fusion+KD step (two freshly initialised
+        deltas, so it runs before any adapter exists; fusion is never checkpointed), and one
+        greedy generation of up to ``max_new_tokens`` from the longest prompt.
         """
         device = self.backbone.device
         batch_size = self.runner.train_cfg.batch_size
+        checkpointing = self.runner.train_cfg.gradient_checkpointing
         task_ids = [a.task_id for a in self.study.initial_adapters] + [t.task_id for t in self.study.evaluation_tasks]
         report: dict[str, Any] = {"batch_size": batch_size,
-                                  "gradient_checkpointing": self.runner.train_cfg.gradient_checkpointing,
+                                  "gradient_checkpointing": checkpointing,
+                                  "selection": "longest TRAIN examples by token count after truncation",
                                   "checks": [], "ok": True}
+        halve = (f"training.batch_size: {max(1, batch_size // 2)} with training.gradient_accumulation_steps: "
+                 f"{self.runner.train_cfg.gradient_accumulation_steps * 2}")
+        adjustments = {
+            "train_step": ("set training.gradient_checkpointing: true (same values, slower training); or "
+                           f"keep the effective batch and halve the micro-batch: {halve}") if not checkpointing
+                          else f"keep the effective batch and halve the micro-batch: {halve}",
+            "fusion_step": (f"fusion is not checkpointed and has no accumulation: {halve} would fit it, but "
+                            "also halves the examples each fusion step sees"),
+            "generation": "generation runs one example at a time; reduce the task's max_input_tokens",
+        }
         fresh = extract_delta(self.peft_model, adapter_id="preflight-old")
         other = AdapterDelta(layers=fresh.layers, adapter_id="preflight-new")
         fusion_cfg = type(self.runner.fusion_cfg)(**{**self.runner.fusion_cfg.__dict__, "steps": 1})
         for task_id in dict.fromkeys(task_ids):
             task = self.tasks[task_id]
             train = list(trainer_guard(self.splits[task_id]).get(SplitName.TRAIN))
-            longest = sorted(train, key=lambda e: len(e.prompt) + len(e.target), reverse=True)[:batch_size]
+            longest, longest_prompt = worst_case_examples(self.backbone.tokenizer, task, train, batch_size)
 
             def batch_of(examples):
                 return collate(self.backbone.tokenizer, examples,
@@ -443,9 +485,18 @@ class DecisionStudy:
                 if check == "train_step":
                     batch = batch_of(longest).to(device)
                     self.peft_model.train()
-                    logits = self.peft_model(input_ids=batch.input_ids,
-                                             attention_mask=batch.attention_mask).logits
-                    masked_cross_entropy(logits, batch.labels).backward()
+                    if checkpointing:   # the same calls as train_adapter, so this measures training
+                        self.peft_model.gradient_checkpointing_enable()
+                        if hasattr(self.peft_model, "enable_input_require_grads"):
+                            self.peft_model.enable_input_require_grads()
+                        assert_backbone_frozen(self.peft_model)
+                    try:
+                        logits = self.peft_model(input_ids=batch.input_ids,
+                                                 attention_mask=batch.attention_mask).logits
+                        masked_cross_entropy(logits, batch.labels).backward()
+                    finally:
+                        if checkpointing and hasattr(self.backbone.model, "gradient_checkpointing_disable"):
+                            self.backbone.model.gradient_checkpointing_disable()
                     self.peft_model.zero_grad(set_to_none=True)
                     self.peft_model.eval()
                     return int(batch.input_ids.shape[1])
@@ -461,8 +512,11 @@ class DecisionStudy:
                     return int(task_batch.input_ids.shape[1])
                 zero_delta_(self.peft_model)
                 with torch.inference_mode():
-                    self.final_evaluator._generate_one(self.peft_model, task, longest[0])
-                return task.max_input_tokens
+                    self.final_evaluator._generate_one(self.peft_model, task, longest_prompt)
+                input_ids, labels = tokenize_example(
+                    self.backbone.tokenizer, longest_prompt, max_input_tokens=task.max_input_tokens,
+                    max_target_tokens=task.max_target_tokens, prompt_truncation=task.prompt_truncation)
+                return sum(1 for label in labels if label == IGNORE_INDEX)
 
             for check in ("train_step", "fusion_step", "generation"):
                 if device == "cuda":
@@ -482,13 +536,7 @@ class DecisionStudy:
                         "task_id": task_id, "check": check, "ok": False,
                         "batch_size": len(longest),
                         "error": f"{type(exc).__name__}: {exc}",
-                        "smallest_adjustment": (
-                            "keep the effective batch and halve the micro-batch: "
-                            f"training.batch_size: {max(1, batch_size // 2)} with "
-                            f"training.gradient_accumulation_steps: "
-                            f"{self.runner.train_cfg.gradient_accumulation_steps * 2}; if that still "
-                            "fails, set training.gradient_checkpointing: true"
-                        ),
+                        "smallest_adjustment": adjustments[check],
                     })
                 finally:
                     self.peft_model.zero_grad(set_to_none=True)

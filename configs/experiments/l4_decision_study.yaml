@@ -94,7 +94,11 @@ training:
   max_steps: null
   batch_size: 4
   gradient_accumulation_steps: 4
-  gradient_checkpointing: false # off; the preflight verifies batch 4 fits before the run starts
+  # On: at batch 4 the longest FinQA TRAIN batch (884 tokens) needs more than the L4's 22 GiB
+  # without it, and 6.3 GiB with it (measured).  Recomputation gives the same values; it costs
+  # training time, which scripts/estimate_decision_study_time.py measures.  Fusion is not
+  # checkpointed; the preflight checks both at the longest batches by token count.
+  gradient_checkpointing: true
   early_stopping_patience: null # no early stop, so every adapter sees exactly one epoch
   eval_every_steps: 125
   intermediate_eval_examples: 16
