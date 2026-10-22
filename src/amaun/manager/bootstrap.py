@@ -29,7 +29,7 @@ from amaun.adapters.delta import AdapterDelta
 from amaun.adapters.lora import load_delta_into
 from amaun.adapters.repository import AdapterRepository
 from amaun.config import ResolvedConfig
-from amaun.data.preprocess import collate, masked_cross_entropy
+from amaun.data.preprocess import IGNORE_INDEX, collate, masked_cross_entropy
 from amaun.data.registry import TaskSpec
 from amaun.data.splits import SplitName, TaskSplits, manager_guard, trainer_guard, utility_guard
 from amaun.errors import ManagerError
@@ -46,6 +46,15 @@ from amaun.manager.targets import (
     measure_outcome_targets,
     sample_pairs,
 )
+from amaun.manager.reuse_gate import (
+    GateExample,
+    ReuseGate,
+    ReuseGateConfig,
+    compute_gate_features,
+    reuse_gap,
+    support_probe_batches,
+)
+from amaun.manager.task_representation import build_task_representation
 from amaun.manager.threshold import select_thresholds
 from amaun.manager.utility_network import (
     OUTCOME_HEADS,
@@ -70,9 +79,12 @@ class BootstrapResult:
     feature_names: list[str]
     wall_seconds: float = 0.0
     notes: list[str] = field(default_factory=list)
+    #: Stage-1 REUSE gate (D-003 O1), fitted on the same dev measurements; None if not configured.
+    reuse_gate: Any | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "reuse_gate": self.reuse_gate.as_dict() if self.reuse_gate is not None else None,
             "thresholds": self.thresholds.as_dict(),
             "supervision": self.supervision.as_dict(),
             "utility_training": self.training_record,
@@ -83,22 +95,38 @@ class BootstrapResult:
         }
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def _validation_loss(model: Any, delta: AdapterDelta, task: TaskSpec, splits: TaskSplits,
-                     tokenizer: Any, device: str, *, max_examples: int) -> float:
-    """Mean masked CE on VALIDATION with ``delta`` installed. Never touches TEST."""
+                     tokenizer: Any, device: str, *, max_examples: int, batch_size: int = 4) -> float:
+    """Token-level mean masked CE on VALIDATION with ``delta`` installed. Never touches TEST.
+
+    Batched: the previous form collated all ``max_examples`` into ONE forward pass, so its
+    logits tensor grew with the example count (it OOM'd on MPS at 32 examples, which is why
+    ``features.performance.max_eval_examples`` had been lowered to 8 for local_smoke).  Each
+    batch's mean is re-weighted by its response-token count, so the result is the same
+    token-level mean the single pass computed.
+    """
     guard = utility_guard(splits)
     examples = list(guard.get(SplitName.VALIDATION))[:max_examples]
     if not examples:
         return float("nan")
     load_delta_into(model, delta)
     model.eval()
-    batch = collate(
-        tokenizer, examples,
-        max_input_tokens=task.max_input_tokens, max_target_tokens=task.max_target_tokens,
-    ).to(device)
-    logits = model(input_ids=batch.input_ids, attention_mask=batch.attention_mask).logits
-    return float(masked_cross_entropy(logits, batch.labels))
+    total, count = 0.0, 0
+    for start in range(0, len(examples), max(1, batch_size)):
+        chunk = examples[start : start + max(1, batch_size)]
+        batch = collate(
+            tokenizer, chunk,
+            max_input_tokens=task.max_input_tokens, max_target_tokens=task.max_target_tokens,
+            prompt_truncation=task.prompt_truncation,
+        ).to(device)
+        logits = model(input_ids=batch.input_ids, attention_mask=batch.attention_mask).logits
+        tokens = int((batch.labels[:, 1:] != IGNORE_INDEX).sum())
+        if tokens:
+            total += float(masked_cross_entropy(logits, batch.labels)) * tokens
+            count += tokens
+        del logits, batch
+    return total / count if count else float("nan")
 
 
 def _loss_to_score(loss: float, *, scale: float) -> float:
@@ -129,8 +157,15 @@ def bootstrap_utility_network(
     dev_tasks: Sequence[TaskSpec],
     splits: Mapping[str, TaskSplits],
     extractor: FeatureExtractor,
+    all_tasks: Sequence[TaskSpec] | None = None,
 ) -> BootstrapResult:
-    """Generate supervision, fit the normaliser, train ``g_omega``, and select thresholds."""
+    """Generate supervision, fit the normaliser, train ``g_omega``, and select thresholds.
+
+    ``all_tasks`` lets forgetting be measured on a candidate's prior tasks even when those are
+    not dev tasks (a bootstrapped seed adapter's task usually is not).  The previous lookup
+    searched ``dev_tasks`` only, so forgetting on any other prior task was silently 0.0 and the
+    integration could be labelled beneficial without having been measured.
+    """
     if repository.is_empty:
         raise ManagerError(
             "utility bootstrapping needs a non-empty repository: there are no candidate pairs to "
@@ -167,6 +202,14 @@ def bootstrap_utility_network(
         "dominant bootstrap cost (D-010). Ordering is preserved; absolute values are proxies.",
     ]
 
+    task_lookup = {t.task_id: t for t in (all_tasks or ())}
+    task_lookup.update({t.task_id: t for t in dev_tasks})
+    n_unmeasured_forgetting = 0
+    eval_batch = int(cfg.get("training.batch_size"))
+    gate_section = cfg.section("utility").get("reuse_gate")
+    gate_cfg = ReuseGateConfig.from_config(gate_section) if gate_section else None
+    gate_examples: list[GateExample] = []
+
     for task in dev_tasks:
         task_splits = splits[task.task_id]
         temp_id = f"devtemp-{task.task_id}"
@@ -176,13 +219,38 @@ def bootstrap_utility_network(
         )
         temp_loss = _validation_loss(
             peft_model, temp_delta, task, task_splits, backbone.tokenizer, backbone.device,
-            max_examples=max_eval,
+            max_examples=max_eval, batch_size=eval_batch,
         )
         baseline_score = _loss_to_score(temp_loss, scale=score_scale)
+
+        # Stage-1 gate evidence: temp-free features on SUPPORT, labelled with the measured gap
+        # between each existing adapter and this task's dedicated adapter on VALIDATION.
+        if gate_cfg is not None:
+            representation = build_task_representation(
+                task.task_id, manager_guard(task_splits), config=cfg.section("task_repr"),
+                backbone=backbone, descriptor=task.description,
+            )
+            gate_features = compute_gate_features(
+                model=peft_model, device=backbone.device,
+                probe_batches=support_probe_batches(backbone.tokenizer, task, task_splits,
+                                                    count=gate_cfg.probe_examples),
+                task_embedding=representation.embedding, candidates=repository.entries(),
+                ece_bins=int(cfg.get("features.performance.ece_bins", 10)),
+            )
 
         # Features for every candidate (cheap relative to fusion).
         vectors = {}
         for entry in repository.entries():
+            candidate_loss = _validation_loss(
+                peft_model, entry.delta, task, task_splits, backbone.tokenizer,
+                backbone.device, max_examples=max_eval, batch_size=eval_batch,
+            )
+            if gate_cfg is not None:
+                gate_examples.append(GateExample(
+                    task_id=task.task_id, candidate_id=entry.adapter_id,
+                    features=gate_features[entry.adapter_id],
+                    gap=reuse_gap(candidate_loss, temp_loss, scale=score_scale),
+                ))
             ctx = CandidateContext(
                 temp_id=temp_id, temp_delta=temp_delta,
                 candidate_id=entry.adapter_id, candidate_delta=entry.delta,
@@ -190,12 +258,7 @@ def bootstrap_utility_network(
                 total_events=max(1, len(dev_tasks)),
                 candidate_task_embedding=entry.metadata.task_embedding,
                 temp_quality={"loss": temp_loss},
-                candidate_quality={
-                    "loss": _validation_loss(
-                        peft_model, entry.delta, task, task_splits, backbone.tokenizer,
-                        backbone.device, max_examples=max_eval,
-                    )
-                },
+                candidate_quality={"loss": candidate_loss},
                 repository_bytes=float(repository.memory_bytes()),
                 repository_size=len(repository),
             )
@@ -212,6 +275,7 @@ def bootstrap_utility_network(
             collate(
                 backbone.tokenizer, task_examples[i : i + 2],
                 max_input_tokens=task.max_input_tokens, max_target_tokens=task.max_target_tokens,
+                prompt_truncation=task.prompt_truncation,
             )
             for i in range(0, len(task_examples), 2)
         ] or None
@@ -241,39 +305,43 @@ def bootstrap_utility_network(
             # --- MEASURE the post-integration outcome (this is the supervision signal) -----
             post_loss = _validation_loss(
                 peft_model, fused_delta, task, task_splits, backbone.tokenizer, backbone.device,
-                max_examples=max_eval,
+                max_examples=max_eval, batch_size=eval_batch,
             )
             candidate_prior_loss = _validation_loss(
                 peft_model, entry.delta, task, task_splits, backbone.tokenizer, backbone.device,
-                max_examples=max_eval,
+                max_examples=max_eval, batch_size=eval_batch,
             )
             # Forgetting: how much worse the fused adapter is on the candidate's own prior
             # task(s) than the candidate was. Positive means capability was lost.
             forgetting = 0.0
-            prior_task_ids = [t for t in entry.metadata.tasks_served if t in splits]
+            forgetting_measured = True
+            prior_task_ids = list(entry.metadata.tasks_served)
             if prior_task_ids:
                 drops = []
                 for prior_id in prior_task_ids:
-                    prior_task = next((t for t in dev_tasks if t.task_id == prior_id), None)
-                    if prior_task is None:
+                    prior_task = task_lookup.get(prior_id)
+                    if prior_task is None or prior_id not in splits:
+                        forgetting_measured = False
                         continue
                     before = _loss_to_score(
                         _validation_loss(
                             peft_model, entry.delta, prior_task, splits[prior_id],
-                            backbone.tokenizer, backbone.device, max_examples=max_eval,
+                            backbone.tokenizer, backbone.device, max_examples=max_eval, batch_size=eval_batch,
                         ),
                         scale=score_scale,
                     )
                     after = _loss_to_score(
                         _validation_loss(
                             peft_model, fused_delta, prior_task, splits[prior_id],
-                            backbone.tokenizer, backbone.device, max_examples=max_eval,
+                            backbone.tokenizer, backbone.device, max_examples=max_eval, batch_size=eval_batch,
                         ),
                         scale=score_scale,
                     )
                     drops.append(max(0.0, before - after))
                 forgetting = sum(drops) / len(drops) if drops else 0.0
 
+            if not forgetting_measured:
+                n_unmeasured_forgetting += 1
             targets, beneficial = measure_outcome_targets(
                 primary_score_post=_loss_to_score(post_loss, scale=score_scale),
                 forgetting_post=forgetting,
@@ -283,6 +351,8 @@ def bootstrap_utility_network(
                 long_term_loss_post=post_loss if post_loss == post_loss else 0.0,
                 primary_score_baseline=baseline_score,
             )
+            # An integration whose forgetting could not be measured is never counted beneficial.
+            beneficial = beneficial and forgetting_measured
             example = SupervisionExample(
                 candidate_id=candidate_id, task_id=task.task_id,
                 features=vectors[candidate_id], targets=targets,
@@ -295,6 +365,11 @@ def bootstrap_utility_network(
 
     if not supervision.examples:
         raise ManagerError("bootstrapping produced zero supervision examples")
+    if n_unmeasured_forgetting:
+        notes.append(
+            f"{n_unmeasured_forgetting} integration(s) had a prior task without loadable splits, "
+            f"so their forgetting was not measured; they are labelled NOT beneficial"
+        )
 
     supervision.proxy_bias = estimate_proxy_bias(
         [e for e in supervision.examples if e.proxy], full_examples
@@ -305,6 +380,39 @@ def bootstrap_utility_network(
             "utility targets are proxy-only (assumption A-12 unverified for this run)"
         )
 
+    network, normalizer, thresholds, record, _ = fit_utility_model(cfg, supervision)
+    reuse_gate = (ReuseGate.fit(gate_examples, gate_cfg, run_mode=cfg.run_mode.value)
+                  if gate_cfg is not None else None)
+    if reuse_gate is not None:
+        notes.extend(f"reuse gate: {note}" for note in reuse_gate.notes)
+
+    log.info(
+        "utility bootstrap: %d examples (%d proxy), final L_U=%.5f, tau_u=%.4f tau_reuse=%.4f",
+        len(supervision), sum(1 for e in supervision.examples if e.proxy),
+        record.final_loss or float("nan"), thresholds.tau_u, thresholds.tau_reuse,
+    )
+    return BootstrapResult(
+        network=network,
+        normalizer=normalizer,
+        thresholds=thresholds,
+        supervision=supervision,
+        training_record=record.as_dict(),
+        feature_names=list(normalizer.feature_names),
+        wall_seconds=time.perf_counter() - start,
+        notes=notes,
+        reuse_gate=reuse_gate,
+    )
+
+
+def fit_utility_model(
+    cfg: ResolvedConfig, supervision: SupervisionSet
+) -> tuple[UtilityNetwork, FeatureNormalizer, Thresholds, Any, list[float]]:
+    """Fit the normaliser, train ``g_omega``, and select thresholds from measured supervision.
+
+    Shared by :func:`bootstrap_utility_network` and the decision study, so both fit the
+    utility model through exactly the same code.  Returns the in-sample utilities as well,
+    because threshold selection is made on them.
+    """
     # --- fit the normaliser on THIS split only (idea.md S4.7 / S16.5) --------------------
     normalizer = FeatureNormalizer(epsilon=float(cfg.get("utility.normalisation.epsilon", 1e-8)))
     normalizer.fit(
@@ -332,19 +440,4 @@ def bootstrap_utility_network(
         observed_utilities=utilities,
         beneficial_flags=[example.beneficial for example in supervision.examples],
     )
-
-    log.info(
-        "utility bootstrap: %d examples (%d proxy), final L_U=%.5f, tau_u=%.4f tau_reuse=%.4f",
-        len(supervision), sum(1 for e in supervision.examples if e.proxy),
-        record.final_loss or float("nan"), thresholds.tau_u, thresholds.tau_reuse,
-    )
-    return BootstrapResult(
-        network=network,
-        normalizer=normalizer,
-        thresholds=thresholds,
-        supervision=supervision,
-        training_record=record.as_dict(),
-        feature_names=list(normalizer.feature_names),
-        wall_seconds=time.perf_counter() - start,
-        notes=notes,
-    )
+    return network, normalizer, thresholds, record, utilities

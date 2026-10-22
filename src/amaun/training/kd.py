@@ -112,7 +112,13 @@ def capture_teacher(
     for batch in batches:
         moved = batch.to(device)
         logits = model(input_ids=moved.input_ids, attention_mask=moved.attention_mask).logits
-        cached.append(logits.detach().to(torch.float32).cpu())
+        # Only response positions are ever read by kd_loss, so only they are cached:
+        # ``[n_response_positions, vocab]`` instead of ``[batch, seq, vocab]``.  At a 151 936-token
+        # vocabulary the full fp32 cache was ~778 MB per 2-example batch of 640 tokens, almost all
+        # of it prompt positions the loss masks out.
+        mask = response_mask(moved.labels)
+        cached.append(logits[:, :-1, :][mask].detach().to(torch.float32).cpu())
+        del logits
         kept.append(batch)
     return TeacherCache(
         teacher_adapter_id=teacher_adapter_id,
@@ -140,18 +146,30 @@ def kd_loss(
     if temperature <= 0:
         raise FusionError("KD temperature must be positive")
     shift_student = student_logits[:, :-1, :]
-    shift_teacher = teacher_logits[:, :-1, :].to(shift_student.device)
     mask = response_mask(labels).to(shift_student.device)
     if mask.sum() == 0:
         return torch.zeros((), device=shift_student.device, dtype=shift_student.dtype)
 
-    student_log_probs = torch.log_softmax(shift_student.float() / temperature, dim=-1)
-    teacher_probs = torch.softmax(shift_teacher.float() / temperature, dim=-1)
-    teacher_log_probs = torch.log_softmax(shift_teacher.float() / temperature, dim=-1)
+    # Both operands are reduced to the masked positions before the fp32 softmaxes, which is
+    # numerically identical to masking afterwards and avoids three full-size fp32 copies.
+    student = shift_student[mask]
+    if teacher_logits.dim() == 2:
+        # Compact cache from capture_teacher: already ``[n_response_positions, vocab]``.
+        teacher = teacher_logits.to(student.device)
+    else:
+        teacher = teacher_logits[:, :-1, :].to(student.device)[mask]
+    if teacher.shape != student.shape:
+        raise FusionError(
+            f"KD teacher/student position mismatch: teacher {tuple(teacher.shape)} vs student "
+            f"{tuple(student.shape)}; the teacher must be captured on the same retention batch"
+        )
+
+    student_log_probs = torch.log_softmax(student.float() / temperature, dim=-1)
+    teacher_log_probs = torch.log_softmax(teacher.float() / temperature, dim=-1)
+    teacher_probs = teacher_log_probs.exp()
     # KL(teacher || student), summed over the vocabulary, averaged over masked positions.
     per_position = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)
-    masked = per_position * mask
-    return (temperature**2) * masked.sum() / mask.sum()
+    return (temperature**2) * per_position.mean()
 
 
 def verify_teacher(cache: TeacherCache, expected_adapter_id: str) -> None:

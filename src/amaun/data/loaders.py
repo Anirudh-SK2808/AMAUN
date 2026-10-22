@@ -77,6 +77,7 @@ class GuardedLoader:
                 max_input_tokens=self.spec.max_input_tokens,
                 max_target_tokens=self.spec.max_target_tokens,
                 use_chat_template=self.use_chat_template,
+                prompt_truncation=self.spec.prompt_truncation,
             )
 
 
@@ -105,4 +106,5 @@ def fixed_reference_batch(
         max_input_tokens=spec.max_input_tokens,
         max_target_tokens=spec.max_target_tokens,
         use_chat_template=use_chat_template,
+        prompt_truncation=spec.prompt_truncation,
     )

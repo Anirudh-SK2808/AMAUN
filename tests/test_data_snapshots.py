@@ -84,6 +84,18 @@ def test_round_trip_preserves_rows_exactly(tmp_path):
     assert manifest.exhausted is False
 
 
+def test_nested_non_string_option_keys_still_hit_the_cache(tmp_path):
+    """IMDb's ``labels: {0: negative, 1: positive}`` became {"0": ...} in the stored manifest,
+    which made every such snapshot a permanent miss (and an offline run impossible)."""
+    spec = _snapshot_spec(row_adapter="label_to_text",
+                          row_adapter_options={"labels": {0: "negative", 1: "positive"}})
+    rows = [{"text": "fine", "label": 1}]
+    path = snapshots.path_for(tmp_path, "sentiment", spec)
+    snapshots.write(path, rows, spec=spec, task_id="sentiment", license="other", exhausted=False)
+    hit = snapshots.read(path, spec)
+    assert hit is not None and hit[0] == rows
+
+
 def test_missing_snapshot_is_a_miss(tmp_path):
     assert snapshots.read(snapshots.path_for(tmp_path, "sum", _snapshot_spec()), _snapshot_spec()) is None
 

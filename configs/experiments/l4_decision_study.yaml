@@ -1,0 +1,223 @@
+# L4 decision study -- the 12-hour single-seed run.  Design and rationale: docs/l4_decision_study.md
+#
+#   .venv/bin/python scripts/run_decision_study.py \
+#       --config configs/experiments/l4_decision_study.yaml --run-mode local_smoke
+#
+# RUN MODE.  Qwen/Qwen2.5-1.5B-Instruct is the `local_smoke` backbone in BACKBONE_REGISTRY, so this
+# arm runs under --run-mode local_smoke and writes to results/local_smoke/l4_decision_study/.  It is
+# therefore labelled NON-REPORTABLE, which is also what one seed and two evaluation tasks warrant
+# (D-012).  `actual` resolves to the 7B backbone and is refused by decision_study.required_backbone.
+#
+# This file deliberately does NOT include experiments/base.yaml: base's run_mode_overrides.local_smoke
+# block is tuned for Apple-Silicon MPS (batch_size 1, gradient checkpointing on, 10 steps, 32-example
+# split cap) and, because overlays are applied after top-level keys, it would silently replace the
+# L4 settings below.  Every experiment-affecting value for this run is in this file or its includes.
+includes:
+  - model/qwen.yaml
+  - training/default.yaml
+  - datasets/curriculum.yaml
+  - fusion/learnable_layerwise.yaml
+  - utility/default.yaml
+  - federated/default.yaml
+
+experiment_id: l4_decision_study
+
+experiment:
+  seeds: [1234]                 # ONE seed for the 12-hour run (results are descriptive, not tested)
+  budget_tolerance: 0.05
+  allow_unequal_budget: false
+  allow_dirty_git: false
+  evaluate_every_task: true
+
+curriculum:
+  repository_init: bootstrap_six          # initial adapters enter R_c unconditionally (D-002 O1)
+  seed_tasks: [sum, qa, sentiment]
+  evaluated_stream: [longform, domain]    # evaluation tasks, held out from utility supervision
+
+evaluation:
+  max_test_examples: 150        # final evaluation: 100-200 examples (TEST holds 300)
+  evaluate_unseen_for_fwt: false
+
+model:
+  device: auto                  # resolves to cuda on the L4 host
+  quantization: none            # bf16 weights, no 4-bit: 1.5B fits in 24 GB unquantised
+
+data:
+  provider: huggingface
+  sampling: shuffled_buffer
+  # >= every split streamed below.  IMDb rows are ordered by label, so a buffer smaller than the
+  # split would yield a class-skewed sample; 25 000 covers the whole IMDb train and test splits.
+  shuffle_buffer_size: 25000
+  smoke_max_examples_per_split: null     # no smoke cap: split_caps below are the declared volumes
+  # Pool partition: 80% TRAIN / 10% VALIDATION / 10% SUPPORT (the curriculum default, 70/15/15,
+  # stays in force for every other arm).  From a 9 000-row pool this gives ~7 200 / ~900 / ~900.
+  split_ratios: {train: 0.80, validation: 0.10, support: 0.10}
+  # Exact sizes, applied in every run mode: 6 000 / 750 / 750 is 80/10/10 of the 7 500 non-test
+  # rows each task uses.  strict => a split that cannot reach its cap raises instead of training or
+  # evaluating on fewer rows than declared.
+  split_caps:
+    train: 6000
+    validation: 750
+    support: 750
+    test: 300
+  split_caps_strict: true
+  # FinQA cannot satisfy 6 000 / 750 / 750: its upstream train split has 6 251 rows (6 203 usable),
+  # fewer than the 7 500 needed.  It keeps 6 000 TRAIN rows, so its ratios leave ~81 VALIDATION /
+  # ~81 SUPPORT and its caps are lowered to match.  This is the one task that is NOT 80/10/10.
+  task_split_ratios:
+    domain: {train: 0.97, validation: 0.015, support: 0.015}
+  task_split_caps:
+    domain: {validation: 64, support: 64}
+  volumes:
+    sum:       {train_pool: 9000, test: 300, test_split: validation}
+    qa:        {train_pool: 9000, test: 300, test_split: validation}
+    sentiment: {train_pool: 9000, test: 300, test_split: test}
+    longform:  {train_pool: 9000, test: 300, test_split: validation}
+    domain:    {train_pool: 6251, test: 300, test_split: test}
+
+datasets:
+  order: [sum, qa, sentiment, longform, domain]
+  tasks:
+    # Summarization: 512 input / 128 target (the run's token budget).  Finance: input restored to
+    # its curriculum value of 768 -- at 512, 146 of 150 FinQA TEST prompts exceeded the limit and lost
+    # part of the context (often the table); 768 + 128 = 896 tokens is now the longest sequence.
+    sum:       {max_input_tokens: 512, max_target_tokens: 128, prompt_truncation: middle}
+    domain:    {max_input_tokens: 768, max_target_tokens: 128, prompt_truncation: middle}
+    # Other tasks keep their curriculum token limits.  `middle` keeps the question / answer cue and
+    # the chat template's assistant header when an input is too long (amaun.data.preprocess).
+    qa:        {prompt_truncation: middle}
+    sentiment: {prompt_truncation: middle}
+    longform:  {prompt_truncation: middle}
+
+training:
+  epochs: 1.0                   # one epoch: 6 000 rows / batch 4 / accumulation 4 = 375 steps
+  max_steps: null
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  gradient_checkpointing: false # off; the preflight verifies batch 4 fits before the run starts
+  early_stopping_patience: null # no early stop, so every adapter sees exactly one epoch
+  eval_every_steps: 125
+  intermediate_eval_examples: 16
+  log_every_steps: 25
+
+task_repr:
+  max_support_examples: 32
+
+features:
+  semantic:
+    hidden_probe_examples: 16
+  gradient:
+    reference_batch_size: 4     # == training.batch_size: a backward pass the preflight has covered
+  performance:
+    max_eval_examples: 16
+
+fusion:
+  steps: 100
+
+kd:
+  # Teacher logits are cached on CPU for response positions only; 16 examples bounds that cache.
+  retention_examples: 16
+
+manager:
+  # REUSE is decided by the stage-1 gate BEFORE training (D-003 O1, utility.reuse_gate); if it does
+  # not fire, A_temp is trained and the utility network decides FUSE / CREATE.  The study also
+  # reports `amaun_train_first` (train_then_decide) on the same measured options.
+  decision_order: prescreen_then_train
+  retrieval:
+    mode: single
+    k: 1                              # pairwise fusion (idea.md S6), so every option is measurable
+  threshold:
+    selection: dev_stream
+    # With few measured integrations every label may be the same; `conservative` then refuses to
+    # merge anything that does not score above every harmful observation (manager/threshold.py).
+    one_class_policy: conservative
+  similarity:                         # the fixed-rule baseline; its threshold is selected on the
+    feature: semantic.d_task_sq       # same supervision measurements as tau_u, not hand-set
+    higher_is_more_similar: false
+
+repository:
+  max_bytes: null                     # no compression: the study measures single decisions
+
+federated:
+  enabled: false
+
+decision_study:
+  required_backbone: Qwen/Qwen2.5-1.5B-Instruct
+  time_budget_hours: 12
+  # Three adapters, three datasets, no shared training rows (verified by content hash at run time
+  # and recorded in decision_study/initial_adapters.json).
+  initial_adapters:
+    - {adapter_id: seed-sum,       task: sum,       role: "existing repository adapter"}
+    - {adapter_id: seed-qa,        task: qa,        role: "incoming task designed to test adapter fusion"}
+    - {adapter_id: seed-sentiment, task: sentiment, role: "repository adapter (role not specified)"}
+  # Similar-task evaluation.  No different-task evaluation task was specified; to add one append
+  #   - {task: dialog, kind: different, related_to: null}
+  # and add `dialog` to datasets.order and data.volumes.
+  evaluation_tasks:
+    - {task: longform, kind: similar, related_to: seed-sum}
+    - {task: domain,   kind: similar, related_to: seed-qa}
+  policies: [amaun, amaun_train_first, always_merge, always_separate, fixed_rule]
+  always_merge:
+    feature: semantic.d_task_sq       # merge partner = nearest candidate by task distance
+    higher_is_more_similar: false
+  supervision_loss_examples: 750      # VALIDATION examples per loss measurement (all of VALIDATION)
+  supervision_generation_examples: 16 # intermediate (generation) evaluation size
+  retention_split: train              # KD D_rep from TRAIN, so VALIDATION stays a clean measurement
+  outcome_tolerance: 0.01             # reporting tolerance for unnecessary-create / harmful flags
+  min_supervision_examples: 20        # below this the run states the utility network cannot generalise
+  evaluate_zero_shot: true
+  measure_all_options: true           # measure CREATE, REUSE_j and FUSE_j for every candidate
+  preflight: true
+  memory_audit:
+    cycles: 3
+    fusion_steps: 2
+    eval_examples: 4
+    allocated_tolerance_mb: 32
+    tensor_tolerance: 8
+
+run_mode_overrides:
+  # Offline wiring check for tests/test_decision_study.py; never a result.
+  dummy:
+    data:
+      provider: synthetic
+      synthetic_pool_size: 120
+      synthetic_test_size: 12
+      split_caps: {train: 16, validation: 6, support: 6, test: 8}
+      task_split_ratios:        # synthetic pools are tiny; FinQA's 0.97 TRAIN ratio would starve SUPPORT
+        domain: {train: 0.70, validation: 0.15, support: 0.15}
+      task_split_caps:          # exercises the per-task override path on the dummy tier
+        domain: {validation: 5, support: 5}
+    evaluation:
+      max_test_examples: 4
+    training:
+      max_steps: 2
+      batch_size: 2
+      gradient_accumulation_steps: 1
+      eval_every_steps: 1
+      intermediate_eval_examples: 2
+      log_every_steps: 1
+    fusion:
+      steps: 2
+    kd:
+      retention_examples: 2
+    utility:
+      training:
+        epochs: 5
+    features:
+      semantic:
+        hidden_probe_examples: 2
+      gradient:
+        reference_batch_size: 2
+      performance:
+        max_eval_examples: 2
+    task_repr:
+      max_support_examples: 4
+    generation:
+      max_new_tokens: 4
+    decision_study:
+      supervision_loss_examples: 4
+      supervision_generation_examples: 2
+      memory_audit:
+        cycles: 3
+        fusion_steps: 1
+        eval_examples: 2

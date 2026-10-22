@@ -159,6 +159,40 @@ class TaskSplits:
             provenance={**self.provenance, "subsampled_to": max_per_split},
         )
 
+    def cap(self, caps: Mapping[str, int], *, seed: int, strict: bool) -> "TaskSplits":
+        """Cap individual splits to exact sizes (``data.split_caps``), deterministically.
+
+        Selection uses the same hash ordering as :meth:`subsample`, so it is reproducible and
+        independent of upstream row order.  With ``strict`` a split that is *smaller* than its
+        cap raises: a run configured for 6 000 TRAIN rows must not silently train on fewer.
+        """
+        reduced = dict(self.splits)
+        shortfalls = []
+        for name, limit in caps.items():
+            if limit is None:
+                continue
+            split = SplitName(name)
+            examples = self.splits[split]
+            if len(examples) < int(limit):
+                shortfalls.append(f"{split.value}: have {len(examples)}, cap {int(limit)}")
+            ordered = sorted(examples, key=lambda e: _bucket(e.task_id, e.example_id, seed))
+            reduced[split] = ordered[: int(limit)]
+        if shortfalls and strict:
+            raise DataError(
+                f"task '{self.task_id}': split(s) smaller than data.split_caps -- "
+                + "; ".join(shortfalls)
+                + ". Raise data.volumes.<task>.train_pool / test, or the task's split ratios, "
+                "rather than training or evaluating on fewer rows than configured."
+            )
+        return TaskSplits(
+            task_id=self.task_id,
+            splits=reduced,
+            seed=self.seed,
+            ratios=self.ratios,
+            provenance={**self.provenance, "split_caps": {str(k): v for k, v in caps.items()},
+                        "split_cap_shortfalls": shortfalls},
+        )
+
 
 def build_splits(
     task_id: str,

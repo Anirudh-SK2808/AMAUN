@@ -10,7 +10,9 @@ from amaun.errors import DataError, UnpinnedDatasetError
 def test_curriculum_has_the_six_initial_tasks(tasks):
     """idea.md S0.2 LoRA-1..6."""
     assert len(tasks) == 6
-    assert {task.task_type for task in tasks} == set(TaskType)
+    # SENTIMENT_CLASSIFICATION exists for the opt-in IMDb task (l4_decision_study), which is
+    # registered in the curriculum but not part of the default six-task order.
+    assert {task.task_type for task in tasks} == set(TaskType) - {TaskType.SENTIMENT_CLASSIFICATION}
 
 
 def test_every_task_documents_its_license_and_test_source(tasks):

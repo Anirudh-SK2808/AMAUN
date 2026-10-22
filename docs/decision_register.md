@@ -118,7 +118,15 @@ O1's training-cost saving is a headline efficiency result; O2 isolates the stora
 without the confound of differing training budgets. Reporting both also directly answers
 falsification question 14 (is the gain from the mechanism or from differing compute?).
 
-**Decision:** _pending user sign-off_.
+**Decision (2026-10-22, user instruction "add a step for reuse before training"):** O1 is
+implemented as a stage-1 REUSE gate (`src/amaun/manager/reuse_gate.py`). With
+`manager.decision_order: prescreen_then_train` and a fitted gate, REUSE is decided from temp-free
+SUPPORT features **before** `A_temp` is trained; if the gate does not fire, the `idea.md` order
+runs (train `A_temp` -> utility network -> FUSE | CREATE) with post-training REUSE disabled. O2
+(`train_then_decide`) remains selectable, and the L4 decision study reports both orders on the
+same measured options (`amaun` vs `amaun_train_first`). Because `prescreen_then_train` is the
+default in `configs/utility/default.yaml`, every arm whose bootstrap fits a gate now skips
+training when the gate fires; before this change the setting was accepted but ignored.
 
 ---
 
@@ -474,7 +482,7 @@ count reduction bought by performance loss is visible.
 |---|---|---|---|
 | D-001 | Backbone tiers | PROVISIONAL | reported results |
 | D-002 | bootstrap_six vs empty_sequential | **OPEN** | **headline experiment** |
-| D-003 | 3-way vs 2-way decision | **OPEN** | **research question scope** |
+| D-003 | 3-way vs 2-way decision | O1 IMPLEMENTED 2026-10-22 (O2 retained) | report both orders |
 | D-004 | top-k fusion | PROVISIONAL | — |
 | D-005 | τ_u selection source | **OPEN** | leakage validity |
 | D-006 | dataset pinning (B1 → dolly-15k, B2 → Pavithree/eli5) | RESOLVED 2026-09-22 (relayed attribution — see entry) | — |

@@ -54,7 +54,7 @@ def main() -> int:
     result = bootstrap_utility_network(
         cfg=cfg, backbone=backbone, peft_model=peft_model, repository=repository,
         dev_tasks=dev_tasks, splits=data.splits,
-        extractor=FeatureExtractor(cfg.section("features")),
+        extractor=FeatureExtractor(cfg.section("features")), all_tasks=data.tasks,
     )
 
     network_path = tracker.paths.utility_network / "utility_network.pt"

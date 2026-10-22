@@ -391,6 +391,46 @@ class _FinqaTextOnly:
 
 
 # --------------------------------------------------------------------------------------
+# label_to_text -- integer class labels (IMDb) rendered as a target word
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _LabelToText:
+    """Classification rows whose target is an integer label (IMDb: ``label`` in {0, 1}).
+
+    The label->word mapping is ``row_adapter_options.labels`` and has no default: which words
+    the model must generate is part of the task definition, and a label missing from the mapping
+    aborts rather than being dropped (a silently filtered class would change the class balance).
+    """
+
+    name: str = "label_to_text"
+
+    def required_row_fields(self, spec: TaskSpec, options: Mapping[str, Any]) -> tuple[str, ...]:
+        return tuple(spec.input_fields) + (spec.target_field,)
+
+    def adapt(
+        self, spec: TaskSpec, row: Mapping[str, Any], options: Mapping[str, Any]
+    ) -> list[AdaptedExample]:
+        labels = options.get("labels")
+        if not isinstance(labels, Mapping) or not labels:
+            raise UnresolvedRowAdapterError(
+                f"row_adapter '{self.name}' requires row_adapter_options.labels, a mapping from "
+                f"upstream label value to target text ({_D015})"
+            )
+        fields = {name: _flatten_text(_require_field(spec, row, name)) for name in spec.input_fields}
+        raw = _require_field(spec, row, spec.target_field)
+        key = str(raw)
+        mapping = {str(k): str(v) for k, v in labels.items()}
+        if key not in mapping:
+            raise DataError(
+                f"task '{spec.task_id}': label {raw!r} has no entry in row_adapter_options.labels "
+                f"{sorted(mapping)}"
+            )
+        return [(fields, mapping[key])]
+
+
+# --------------------------------------------------------------------------------------
 # Registry
 # --------------------------------------------------------------------------------------
 
@@ -403,6 +443,7 @@ ROW_ADAPTERS: dict[str, RowAdapter] = {
         _DialogAllPrefixes(),
         _FinqaPreTablePost(),
         _FinqaTextOnly(),
+        _LabelToText(),
     )
 }
 

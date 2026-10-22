@@ -143,14 +143,21 @@ class FeatureExtractor:
 @torch.no_grad()
 def probe_quality(
     model: Any,
-    delta: AdapterDelta,
+    delta: AdapterDelta | None,
     batches: Sequence[TokenizedBatch],
     device: str,
     *,
     ece_bins: int,
 ) -> dict[str, float]:
-    """Loss, confidence, entropy, and ECE for one adapter on a fixed batch set."""
-    load_delta_into(model, delta)
+    """Loss, confidence, entropy, and ECE for one adapter on a fixed batch set.
+
+    ``delta=None`` measures the frozen backbone itself (LoRA ``B`` zeroed), which the REUSE
+    gate uses as the no-adapter reference.
+    """
+    if delta is None:
+        zero_delta_(model)
+    else:
+        load_delta_into(model, delta)
     model.eval()
     losses, confidences, entropies, eces, accuracies = [], [], [], [], []
     for batch in batches:

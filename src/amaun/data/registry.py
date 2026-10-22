@@ -27,6 +27,7 @@ class TaskType(str, enum.Enum):
     DIALOGUE = "dialogue"
     LONG_FORM_GENERATION = "long_form_generation"
     DOMAIN_GENERATION = "domain_generation"
+    SENTIMENT_CLASSIFICATION = "sentiment_classification"
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,9 @@ class TaskSpec:
     row_adapter: str | None = None
     row_adapter_options: dict[str, Any] = field(default_factory=dict)
     row_adapter_reason: str = ""
+    # How an over-length prompt is cut (amaun.data.preprocess.encode_prompt).  "head" is the
+    # original behaviour and stays the default so no existing arm changes.
+    prompt_truncation: str = "head"
 
     def require_pinned(self) -> None:
         if not self.pinned or self.hf_id is None:
@@ -109,6 +113,7 @@ def task_spec_from_config(task_id: str, section: dict[str, Any]) -> TaskSpec:
         row_adapter=section.get("row_adapter"),
         row_adapter_options=dict(section.get("row_adapter_options") or {}),
         row_adapter_reason=str(section.get("row_adapter_reason", "")),
+        prompt_truncation=str(section.get("prompt_truncation", "head")),
     )
 
 

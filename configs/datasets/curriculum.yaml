@@ -206,3 +206,32 @@ datasets:
       row_adapter_options:
         table_format: markdown
       row_adapter_reason: "D-015 (b): pre_text + markdown table + post_text"
+
+    # Opt-in task: registered but NOT in `datasets.order` above, so no existing arm loads it.
+    # Used by configs/experiments/l4_decision_study.yaml as the third repository adapter.
+    sentiment:
+      task_name: Sentiment Analysis
+      task_type: sentiment_classification
+      description: "Binary movie-review sentiment classification over IMDb."
+      hf_id: stanfordnlp/imdb
+      # Resolved from the live Hub on 2026-10-22 (parquet files on main under plain_text/).
+      hf_revision: e6281661ce1c48d982bc483cf8a173c1bbeb5d31
+      hf_config: plain_text
+      pinned: true
+      license: "other (per dataset card; Maas et al. 2011 research release)"
+      license_notes: >-
+        'Re-verify at download time. Upstream rows are ORDERED BY LABEL (12 500 negative then
+        12 500 positive in each split), so data.shuffle_buffer_size must cover the whole split or
+        the sample is class-skewed.'
+      primary_score: exact_match       # single-label classification: exact match == accuracy
+      metrics: [exact_match]
+      input_fields: [text]
+      target_field: label
+      prompt_template: "Classify the sentiment of the following movie review as positive or negative.\n\nReview:\n{text}\n\nSentiment:"
+      max_input_tokens: 512
+      max_target_tokens: 4
+      upstream_test_source: "upstream 'test' split (25 000 rows)"
+      row_adapter: label_to_text
+      row_adapter_options:
+        labels: {0: negative, 1: positive}
+      row_adapter_reason: "IMDb label 0/1 rendered as the words negative/positive"

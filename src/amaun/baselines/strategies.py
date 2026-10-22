@@ -155,6 +155,50 @@ class NaiveAverageStrategy(ManagementStrategy):
 
 
 # --------------------------------------------------------------------------------------
+# Always merge -- decision-quality baseline for the L4 decision study
+# --------------------------------------------------------------------------------------
+class AlwaysMergeStrategy(ManagementStrategy):
+    """Always FUSE, with the candidate nearest by one configured feature.
+
+    Differs from B3 only in *which* candidate and *how*: B3 fixes uniform, non-learnable
+    coefficients and picks by id order; this policy uses the same learnable fusion + KD as
+    AMAUN, so a comparison against it isolates the merge-or-not decision itself.
+    """
+
+    strategy_id = "always_merge"
+    description = "Always fuse with the nearest candidate by a single feature (decision baseline)"
+
+    def __init__(self, feature: str, *, higher_is_more_similar: bool) -> None:
+        self.feature = feature
+        self.higher_is_more_similar = higher_is_more_similar
+
+    def score(self, vectors, *, run_mode):
+        scores: list[CandidateScore] = []
+        for adapter_id, vector in sorted(vectors.items()):
+            values = vector.as_dict()
+            if self.feature not in values or self.feature in vector.missing:
+                raise KeyError(
+                    f"always_merge needs a measured '{self.feature}' for candidate '{adapter_id}'; "
+                    f"it is {'missing' if self.feature in vector.missing else 'absent'}"
+                )
+            raw = values[self.feature]
+            oriented = raw if self.higher_is_more_similar else -raw
+            scores.append(CandidateScore(
+                adapter_id=adapter_id, utility=float(oriented), outcomes={self.feature: float(raw)},
+                feature_signature=vector.signature(), n_features=1,
+            ))
+        return sorted(scores, key=lambda s: s.utility, reverse=True)
+
+    def decide(self, *, task_id, task_index, scores, repository_size, temp_adapter_trained, config_hash):
+        return _forced_decision(
+            outcome=Outcome.FUSE, task_id=task_id, task_index=task_index, scores=scores,
+            repository_size=repository_size, temp_adapter_trained=temp_adapter_trained,
+            reason=f"policy: always fuse with the nearest candidate by '{self.feature}'",
+            strategy_id=self.strategy_id, config_hash=config_hash,
+        )
+
+
+# --------------------------------------------------------------------------------------
 # B4 -- similarity-based selection (the direct H1 comparison)
 # --------------------------------------------------------------------------------------
 @dataclass
@@ -256,6 +300,7 @@ class AmaunStrategy(ManagementStrategy):
         decision_order: str,
         allowed_outcomes: Sequence[str],
         top_k: int,
+        reuse_gate: Any | None = None,
     ) -> None:
         self.network = network
         self.normalizer = normalizer
@@ -263,7 +308,19 @@ class AmaunStrategy(ManagementStrategy):
         self.decision_order = decision_order
         self.allowed_outcomes = list(allowed_outcomes)
         self.top_k = top_k
+        #: Stage-1 REUSE gate (amaun.manager.reuse_gate.ReuseGate), consulted before training when
+        #: decision_order == prescreen_then_train.  None keeps the post-training pre-screen only.
+        self.reuse_gate = reuse_gate
         self._prescreen_passed: bool = False
+
+    @property
+    def gates_before_training(self) -> bool:
+        """True when REUSE is decided before A_temp is trained (D-003 O1)."""
+        return (
+            self.decision_order == "prescreen_then_train"
+            and self.reuse_gate is not None
+            and "REUSE" in self.allowed_outcomes
+        )
 
     def set_prescreen(self, passed: bool) -> None:
         """Record whether the support-set reuse pre-screen passed (D-003 option O1)."""

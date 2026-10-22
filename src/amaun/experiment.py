@@ -246,10 +246,20 @@ def prepare_data(cfg: ResolvedConfig, *, task_ids: Sequence[str] | None = None) 
     splits: dict[str, TaskSplits] = {}
     blocked: dict[str, str] = {}
     load_reports: dict[str, list[Any]] = {}
+    task_ratios_cfg = data_cfg.get("task_split_ratios") or {}
+    split_caps = data_cfg.get("split_caps") or {}
+    # Per-task cap overrides, for corpora that cannot supply the global caps (FinQA).
+    task_caps_cfg = data_cfg.get("task_split_caps") or {}
     for task in tasks:
         provenance: dict[str, Any] = {
             "provider": provider, "hf_id": task.hf_id, "hf_revision": task.hf_revision,
         }
+        # Per-task ratios exist for corpora too small for the global ratios to reach the
+        # configured TRAIN size (FinQA: 6 251 upstream train rows, so 70% TRAIN is ~4 376).
+        task_ratios = (
+            SplitRatios.from_config(task_ratios_cfg[task.task_id])
+            if task.task_id in task_ratios_cfg else ratios
+        )
         if provider == "synthetic":
             pool = synthetic_pool(task, int(data_cfg["synthetic_pool_size"]), seed=data_seed)
             test = synthetic_pool(
@@ -309,9 +319,17 @@ def prepare_data(cfg: ResolvedConfig, *, task_ids: Sequence[str] | None = None) 
             raise PreconditionError(f"unknown data.provider '{provider}'")
 
         task_splits = build_splits(
-            task.task_id, training_pool=pool, test_pool=test, seed=data_seed, ratios=ratios,
+            task.task_id, training_pool=pool, test_pool=test, seed=data_seed, ratios=task_ratios,
             provenance=provenance,
         )
+        caps = {**split_caps, **(task_caps_cfg.get(task.task_id) or {})}
+        if caps:
+            # Exact per-split sizes, applied in every run mode: they are the experiment's
+            # declared volumes (e.g. 6 000 TRAIN / 300 TEST), not a smoke-test shortcut.
+            task_splits = task_splits.cap(
+                caps, seed=data_seed, strict=bool(data_cfg.get("split_caps_strict", True)),
+            )
+            task_splits.assert_disjoint()
         cap = data_cfg.get("smoke_max_examples_per_split")
         if cap and cfg.run_mode is not RunMode.ACTUAL:
             # idea.md S0.2.1: one config key, applied uniformly to all four splits.

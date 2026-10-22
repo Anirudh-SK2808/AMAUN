@@ -62,6 +62,18 @@ utility:
   normalisation:
     fit_split: utility_train        # never test (invariant I6.2)
     epsilon: 1.0e-8
+  # Stage-1 REUSE gate (D-003 O1): with decision_order == prescreen_then_train, REUSE is decided on
+  # SUPPORT evidence BEFORE any temporary adapter is trained (amaun/manager/reuse_gate.py).  If it
+  # does not fire, the task is trained and the utility network decides FUSE or CREATE.
+  reuse_gate:
+    enabled: true
+    # Fires when the predicted gap score(existing) - score(dedicated adapter) is >= -tolerance, in
+    # the supervision proxy exp(-loss / loss_to_score_scale).  A definition, not a fitted value.
+    tolerance: 0.01
+    ridge_lambda: 1.0               # few examples: ridge keeps the multi-feature fit stable
+    probe_examples: 16              # SUPPORT examples per gate measurement
+    require_gain_over_backbone: true  # the reused adapter must beat the frozen backbone on SUPPORT
+    min_train_examples: 2           # below this the gate is disabled (never fires)
 
 manager:
   decision_order: prescreen_then_train   # prescreen_then_train | train_then_decide (D-003)
@@ -78,6 +90,7 @@ manager:
     fixed_tau_u: 0.5                # used only when selection == fixed
     fixed_tau_reuse: 0.7
   allowed_outcomes: [REUSE, FUSE, CREATE]
+
 
 repository:
   max_bytes: null                   # R_max. null => no compression trigger (ablation A5)

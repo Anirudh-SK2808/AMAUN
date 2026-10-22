@@ -114,12 +114,15 @@ def main() -> int:
         result = bootstrap_utility_network(
             cfg=cfg, backbone=backbone, peft_model=temp_runner.peft_model,
             repository=repository, dev_tasks=dev_tasks, splits=data.splits, extractor=extractor,
+            all_tasks=data.tasks,
         )
         result.network.save(
             tracker.paths.utility_network / "utility_network.pt",
             run_mode=cfg.run_mode.value, feature_names=result.feature_names,
         )
         result.normalizer.save(tracker.paths.utility_network / "normalizer.json")
+        if result.reuse_gate is not None:
+            result.reuse_gate.save(tracker.paths.utility_network / "reuse_gate.json")
         bootstrap_payload = result.as_dict()
         tracker.write_json("utility_network/bootstrap_report.json", bootstrap_payload)
 
@@ -128,6 +131,7 @@ def main() -> int:
             decision_order=str(cfg.get("manager.decision_order")),
             allowed_outcomes=cfg.get("manager.allowed_outcomes"),
             top_k=int(cfg.get("manager.retrieval.k")),
+            reuse_gate=result.reuse_gate,
         )
     else:
         strategy = build_strategy(args.strategy, cfg.section("manager"))

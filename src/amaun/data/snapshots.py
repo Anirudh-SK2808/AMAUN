@@ -126,7 +126,11 @@ def read(path: Path, spec: SnapshotSpec) -> tuple[list[dict[str, Any]], Snapshot
         return None
     if manifest_data.get("key") != spec.key():
         return None
-    if manifest_data.get("spec") != spec.as_key_payload():
+    # Compare in JSON form: the stored spec has been through a JSON round-trip, which turns
+    # nested non-string mapping keys (IMDb's ``labels: {0: negative}``) into strings.  Comparing
+    # against the raw payload made such a snapshot a permanent cache miss.
+    expected = json.loads(json.dumps(spec.as_key_payload(), sort_keys=True, default=str))
+    if manifest_data.get("spec") != expected:
         return None
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     if _content_sha256(rows) != manifest_data.get("content_sha256"):

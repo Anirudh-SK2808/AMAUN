@@ -14,7 +14,7 @@ from typing import Any, Sequence
 import torch
 
 from amaun.adapters.delta import AdapterDelta
-from amaun.data.preprocess import build_chat_prompt, collate, masked_cross_entropy
+from amaun.data.preprocess import collate, encode_prompt, masked_cross_entropy
 from amaun.data.registry import TaskSpec
 from amaun.data.splits import Example, SplitAccessGuard, SplitName
 from amaun.errors import EvaluationError, SplitAccessViolation
@@ -101,6 +101,7 @@ class Evaluator:
                 tokenizer, chunk,
                 max_input_tokens=task.max_input_tokens,
                 max_target_tokens=task.max_target_tokens,
+                prompt_truncation=task.prompt_truncation,
             ).to(device)
             logits = model(input_ids=batch.input_ids, attention_mask=batch.attention_mask).logits
             losses.append(float(masked_cross_entropy(logits, batch.labels)))
@@ -137,11 +138,14 @@ class Evaluator:
     def _generate_one(self, model: Any, task: TaskSpec, example: Example) -> str:
         tokenizer = self.backbone.tokenizer
         device = self.backbone.device
-        prompt = build_chat_prompt(tokenizer, example.prompt)
-        encoded = tokenizer(
-            prompt, return_tensors="pt", truncation=True, max_length=task.max_input_tokens
+        # The same encoder as training (collate -> tokenize_example), so the prompt the model is
+        # evaluated on is the prompt it was trained on, including the truncation policy.
+        ids = encode_prompt(
+            tokenizer, example.prompt, max_input_tokens=task.max_input_tokens,
+            truncation=task.prompt_truncation,
         )
-        encoded = {k: v.to(device) for k, v in encoded.items()}
+        input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+        encoded = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
         kwargs = self.generation.to_kwargs(
             pad_token_id=getattr(tokenizer, "pad_token_id", None),
             eos_token_id=getattr(tokenizer, "eos_token_id", None),

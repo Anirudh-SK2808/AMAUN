@@ -277,12 +277,14 @@ def step_fusion(state):
         collate(
             state["backbone"].tokenizer, guard.get(SplitName.TRAIN)[:2],
             max_input_tokens=task.max_input_tokens, max_target_tokens=task.max_target_tokens,
+            prompt_truncation=task.prompt_truncation,
         )
     ]
     retention = [
         collate(
             state["backbone"].tokenizer, guard.get(SplitName.VALIDATION)[:2],
             max_input_tokens=task.max_input_tokens, max_target_tokens=task.max_target_tokens,
+            prompt_truncation=task.prompt_truncation,
         )
     ]
     fusion_cfg = FusionConfig.from_config(

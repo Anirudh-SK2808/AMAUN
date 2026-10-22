@@ -16,6 +16,10 @@ Written for: whoever executes the runs. Assumes `pytest -q` and the `dummy` smok
 
 Everything below is the procedure, verified end to end on the `dummy` tier.
 
+**L4 decision study.** The 12-hour single-seed run (Qwen2.5-1.5B-Instruct; 3 adapters; ELI5 and
+FinQA similar-task evaluation) has its own driver and document: `scripts/run_decision_study.py`,
+`docs/l4_decision_study.md`.
+
 ## 1. Order of operations
 
 ```bash

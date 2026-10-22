@@ -14,6 +14,7 @@ and reviewable in one place.
 
 from __future__ import annotations
 
+import itertools
 import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
@@ -86,6 +87,8 @@ class TaskEvent:
     evaluations: list[dict[str, Any]] = field(default_factory=list)
     #: VALIDATION scores used as continual-feature inputs (never TEST) -- see _prior_scores.
     validation_scores: dict[str, float] = field(default_factory=dict)
+    #: Stage-1 REUSE gate outcome when it ran (prescreen_then_train), else None.
+    reuse_gate: dict[str, Any] | None = None
     wall_seconds: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
@@ -181,6 +184,11 @@ class ContinualRunner:
         for task_id in seed_task_ids:
             task = self.tasks[task_id]
             adapter_id = f"seed-{task_id}"
+            # The seed adapter's metadata carries its task embedding (SUPPORT only), exactly as an
+            # adapter created during the stream does.  Without it every candidate's
+            # ``semantic.d_task_sq`` was a missing-value sentinel, so the task-distance feature --
+            # and the fixed-rule baselines that read it -- never saw a real value.
+            self.ensure_representation(task_id)
             delta, record = train_adapter(
                 backbone=self.backbone, task=task, guard=self._trainer_guard(task_id),
                 lora_spec=self.lora_spec, train_cfg=self.train_cfg, resolved=self.cfg,
@@ -234,6 +242,17 @@ class ContinualRunner:
             tasks_served=list(tasks_served),
         )
 
+    def ensure_representation(self, task_id: str) -> TaskRepresentation:
+        """Build (once) and cache the SUPPORT-only task representation for ``task_id``."""
+        if task_id not in self.representations:
+            task = self.tasks[task_id]
+            self.representations[task_id] = build_task_representation(
+                task_id, self._manager_guard(task_id),
+                config=self.cfg.section("task_repr"), backbone=self.backbone,
+                descriptor=task.description,
+            )
+        return self.representations[task_id]
+
     # -- probes ------------------------------------------------------------------
     def _probe_batches(self, task_id: str, *, count: int) -> list:
         """Support-set batches used for every candidate's probes (manager guard only)."""
@@ -247,14 +266,24 @@ class ContinualRunner:
                 self.backbone.tokenizer, examples[i : i + 2],
                 max_input_tokens=task.max_input_tokens,
                 max_target_tokens=task.max_target_tokens,
+                prompt_truncation=task.prompt_truncation,
             )
             for i in range(0, len(examples), 2)
         ]
 
     def _build_contexts(
-        self, task_id: str, task_index: int, temp_delta: AdapterDelta
+        self,
+        task_id: str,
+        task_index: int,
+        temp_delta: AdapterDelta,
+        candidates: Sequence[AdapterEntry] | None = None,
     ) -> dict[str, CandidateContext]:
-        """Extract features for every candidate pair ``(A_temp, A_i)``."""
+        """Extract features for every candidate pair ``(A_temp, A_i)``.
+
+        ``candidates`` defaults to every repository adapter (idea.md S4).  The decision study
+        passes an explicit subset so a repository adapter can play the incoming role against the
+        others through the *same* probe protocol used at decision time.
+        """
         features_cfg = self.cfg.section("features")
         probe_count = int(features_cfg.get("semantic", {}).get("hidden_probe_examples", 8))
         eval_count = int(features_cfg.get("performance", {}).get("max_eval_examples", 8))
@@ -282,7 +311,7 @@ class ContinualRunner:
 
         representation = self.representations.get(task_id)
         contexts: dict[str, CandidateContext] = {}
-        for entry in self.repository.entries():
+        for entry in (self.repository.entries() if candidates is None else candidates):
             divergence = (
                 probe_semantic_divergence(
                     self.peft_model, temp_delta, entry.delta, probe[:1], self.backbone.device
@@ -384,46 +413,62 @@ class ContinualRunner:
         log.info("=== task %d: %s (%s) ===", task_index, task_id, task.task_name)
 
         # 1. Task representation -- SUPPORT only.
-        representation = build_task_representation(
-            task_id, self._manager_guard(task_id),
-            config=self.cfg.section("task_repr"), backbone=self.backbone,
-            descriptor=task.description,
-        )
-        self.representations[task_id] = representation
+        self.ensure_representation(task_id)
 
-        # 2. Train the temporary adapter (idea.md S5.4 line 1).  It goes to the candidate
-        #    store, never to R_c (master-prompt constraint 10).
+        # 1b. Stage-1 REUSE gate (D-003 O1): decided on SUPPORT before anything is trained.
+        gate = None
+        if (isinstance(self.strategy, AmaunStrategy) and self.strategy.gates_before_training
+                and len(self.repository) > 0):
+            gate, _ = self.reuse_gate_features_and_decision(task_id, self.repository.entries())
+
         temp_id = f"temp-{task_id}-{task_index}"
-        temp_delta, train_record = train_adapter(
-            backbone=self.backbone, task=task, guard=self._trainer_guard(task_id),
-            lora_spec=self.lora_spec, train_cfg=self.train_cfg, resolved=self.cfg,
-            adapter_id=temp_id, budget=self.budget,
-        )
-        self._cumulative_train_seconds += train_record.wall_seconds
-        temp_entry = AdapterEntry(
-            delta=temp_delta,
-            metadata=self._metadata_for(
-                temp_id, task, temp_delta, train_record.as_dict(), AdapterOrigin.TRAINED, [task_id]
-            ),
-        )
-        self.repository.candidates.put(temp_entry)
+        temp_delta = temp_entry = train_record = None
+        vectors: dict[str, Any] = {}
+        feature_dimension = None
+        if gate is not None and gate.fired:
+            from amaun.manager.reuse_gate import gate_reuse_decision
 
-        # 3. Features and scoring.
-        contexts = self._build_contexts(task_id, task_index, temp_delta)
-        vectors = {cid: self.extractor.extract(ctx) for cid, ctx in contexts.items()}
-        feature_dimension = len(next(iter(vectors.values()))) if vectors else None
-        scores = self.strategy.score(vectors, run_mode=self.cfg.run_mode.value) if vectors else []
+            decision = gate_reuse_decision(
+                gate, task_id=task_id, task_index=task_index, thresholds=self.strategy.thresholds,
+                repository_size=len(self.repository), config_hash=self.cfg.config_hash,
+            )
+            self.tracker.log_decision(**decision.as_dict(), strategy=self.strategy.strategy_id,
+                                      feature_dimension=None, reuse_gate=gate.as_dict())
+        else:
+            # 2. Train the temporary adapter (idea.md S5.4 line 1).  It goes to the candidate
+            #    store, never to R_c (master-prompt constraint 10).
+            temp_delta, train_record = train_adapter(
+                backbone=self.backbone, task=task, guard=self._trainer_guard(task_id),
+                lora_spec=self.lora_spec, train_cfg=self.train_cfg, resolved=self.cfg,
+                adapter_id=temp_id, budget=self.budget,
+            )
+            self._cumulative_train_seconds += train_record.wall_seconds
+            temp_entry = AdapterEntry(
+                delta=temp_delta,
+                metadata=self._metadata_for(
+                    temp_id, task, temp_delta, train_record.as_dict(), AdapterOrigin.TRAINED, [task_id]
+                ),
+            )
+            self.repository.candidates.put(temp_entry)
 
-        # 4. Decide.
-        if isinstance(self.strategy, AmaunStrategy):
-            self.strategy.set_prescreen(self._reuse_prescreen(vectors))
-        decision = self.strategy.decide(
-            task_id=task_id, task_index=task_index, scores=scores,
-            repository_size=len(self.repository), temp_adapter_trained=True,
-            config_hash=self.cfg.config_hash,
-        )
-        self.tracker.log_decision(**decision.as_dict(), strategy=self.strategy.strategy_id,
-                                  feature_dimension=feature_dimension)
+            # 3. Features and scoring.
+            contexts = self._build_contexts(task_id, task_index, temp_delta)
+            vectors = {cid: self.extractor.extract(ctx) for cid, ctx in contexts.items()}
+            feature_dimension = len(next(iter(vectors.values()))) if vectors else None
+            scores = self.strategy.score(vectors, run_mode=self.cfg.run_mode.value) if vectors else []
+
+            # 4. Decide.
+            if isinstance(self.strategy, AmaunStrategy):
+                # A gate that ran and did not fire has already rejected REUSE on this task.
+                self.strategy.set_prescreen(False if gate is not None else self._reuse_prescreen(vectors))
+            decision = self.strategy.decide(
+                task_id=task_id, task_index=task_index, scores=scores,
+                repository_size=len(self.repository), temp_adapter_trained=True,
+                config_hash=self.cfg.config_hash,
+            )
+            self.tracker.log_decision(**decision.as_dict(), strategy=self.strategy.strategy_id,
+                                      feature_dimension=feature_dimension,
+                                      reuse_gate=gate.as_dict() if gate is not None else None)
 
         # 5. Execute the decision.
         fusion_payload: dict[str, Any] | None = None
@@ -431,7 +476,8 @@ class ContinualRunner:
         if decision.outcome is Outcome.REUSE:
             active_adapter_id = decision.selected_adapter_ids[0]
             self.repository.mark_reuse(active_adapter_id, task_id, task_index)
-            self.repository.candidates.discard(temp_id)   # A_temp is thrown away
+            if temp_delta is not None:
+                self.repository.candidates.discard(temp_id)   # A_temp is thrown away
 
         elif decision.outcome is Outcome.FUSE:
             components = [
@@ -439,13 +485,19 @@ class ContinualRunner:
                 for adapter_id in decision.selected_adapter_ids
             ] + [temp_delta]
             fused_id = f"fused-{task_id}-{task_index}"
-            task_batches = list(
-                GuardedLoader(
+            # islice, not list(...)[:steps]: identical batches, but only the ones fusion uses are
+            # tokenised and held (the slice form collated the whole TRAIN split first).
+            task_batches = list(itertools.islice(
+                iter(GuardedLoader(
                     self._trainer_guard(task_id), SplitName.TRAIN, task, self.backbone.tokenizer,
                     BatchPlan(batch_size=self.train_cfg.batch_size, shuffle=True, seed=self.cfg.seed),
-                )
-            )[: max(1, self.fusion_cfg.steps)]
-            retention = self._retention_batches(exclude_task=task_id)
+                )),
+                max(1, self.fusion_cfg.steps),
+            ))
+            retention = self._retention_batches(
+                exclude_task=task_id,
+                teacher_tasks=self.repository.retrieve(decision.selected_adapter_ids[0]).metadata.tasks_served,
+            )
             fused_delta, fusion_record = run_fusion_kd(
                 backbone=self.backbone, peft_model=self.peft_model, components=components,
                 task_batches=task_batches, retention_batches=retention,
@@ -487,7 +539,7 @@ class ContinualRunner:
 
         efficiency = efficiency_snapshot(
             self.repository, task_index=task_index, n_tasks_seen=len(self.matrix.task_order),
-            trainable_parameters_this_event=train_record.trainable_parameters,
+            trainable_parameters_this_event=train_record.trainable_parameters if train_record else 0,
             training_seconds_cumulative=self._cumulative_train_seconds,
         )
 
@@ -502,13 +554,14 @@ class ContinualRunner:
             active_adapter_id=active_adapter_id,
             n_candidates=len(vectors),
             feature_dimension=feature_dimension,
-            training=train_record.as_dict(),
+            training=train_record.as_dict() if train_record else None,
             fusion=fusion_payload,
             compression=compression_payload,
             efficiency=efficiency.as_dict(),
             evaluations=evaluations,
             validation_scores=validation_scores,
             wall_seconds=time.perf_counter() - start,
+            reuse_gate=gate.as_dict() if gate is not None else None,
         )
         self.events.append(event)
         self.tracker.log_metric(
@@ -527,6 +580,30 @@ class ContinualRunner:
         )
         return event
 
+    def reuse_gate_features_and_decision(self, task_id: str, candidates: Sequence[AdapterEntry]):
+        """Stage-1 REUSE gate on ``task_id``'s SUPPORT for ``candidates``; no A_temp involved.
+
+        Returns ``(GateDecision, features)``.  The same function produces the gate's training
+        features (decision study) and its decision-time features, so the two cannot drift.
+        """
+        gate = self.strategy.reuse_gate
+        features = self.reuse_gate_features(task_id, candidates, probe_examples=gate.config.probe_examples)
+        return gate.decide(features, run_mode=self.cfg.run_mode.value), features
+
+    def reuse_gate_features(self, task_id: str, candidates: Sequence[AdapterEntry], *,
+                            probe_examples: int) -> dict[str, dict[str, float | None]]:
+        """Temp-free gate features of ``candidates`` on ``task_id``'s SUPPORT (manager guard)."""
+        from amaun.manager.reuse_gate import compute_gate_features, support_probe_batches
+
+        probe = support_probe_batches(
+            self.backbone.tokenizer, self.tasks[task_id], self.splits[task_id], count=probe_examples,
+        )
+        return compute_gate_features(
+            model=self.peft_model, device=self.backbone.device, probe_batches=probe,
+            task_embedding=self.ensure_representation(task_id).embedding, candidates=candidates,
+            ece_bins=int(self.cfg.get("features.performance.ece_bins", 10)),
+        )
+
     def _reuse_prescreen(self, vectors: Mapping[str, Any]) -> bool:
         """Support-set pre-screen for the REUSE outcome (D-003 O1).
 
@@ -544,22 +621,38 @@ class ContinualRunner:
                 return True
         return False
 
-    def _retention_batches(self, *, exclude_task: str) -> list:
-        """``D_rep`` for KD: prior tasks' TRAIN/VALIDATION data, never TEST."""
-        limit = self.kd_cfg.retention_examples
+    def _retention_batches(
+        self, *, exclude_task: str, teacher_tasks: Sequence[str] = ()
+    ) -> list:
+        """``D_rep`` for KD: TRAIN/VALIDATION data of the tasks to preserve, never TEST.
+
+        The teacher is the pre-merge old adapter (idea.md S16.9), so the behaviour to preserve is
+        on *its* tasks.  ``teacher_tasks`` therefore come first, then any other previously seen
+        task.  The previous version iterated ``self.matrix.task_order`` only -- the evaluated
+        stream -- so a bootstrapped seed adapter's task was never in it and KD silently ran with
+        an empty retention set.  It also took 2 examples per task regardless of
+        ``kd.retention_examples``; the configured |D_rep| is now honoured, split across tasks.
+        """
+        limit = int(self.kd_cfg.retention_examples)
+        ordered: list[str] = []
+        for task_id in list(teacher_tasks) + list(self.matrix.task_order):
+            if task_id != exclude_task and task_id in self.tasks and task_id not in ordered:
+                ordered.append(task_id)
+        if not ordered or limit <= 0:
+            return []
+        per_task = max(1, -(-limit // len(ordered)))   # ceil
         batches = []
-        for task_id in self.matrix.task_order:
-            if task_id == exclude_task or len(batches) * 2 >= limit:
-                continue
+        for task_id in ordered:
             task = self.tasks[task_id]
             guard = self._trainer_guard(task_id)
-            examples = list(guard.get(SplitName.VALIDATION))[:2] or list(guard.get(SplitName.TRAIN))[:2]
-            if examples:
+            examples = list(guard.get(SplitName.VALIDATION))[:per_task] or list(guard.get(SplitName.TRAIN))[:per_task]
+            for start in range(0, len(examples), 2):
                 batches.append(
                     collate(
-                        self.backbone.tokenizer, examples,
+                        self.backbone.tokenizer, examples[start : start + 2],
                         max_input_tokens=task.max_input_tokens,
                         max_target_tokens=task.max_target_tokens,
+                        prompt_truncation=task.prompt_truncation,
                     )
                 )
         return batches

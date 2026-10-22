@@ -101,11 +101,30 @@ def select_thresholds(
         tau_u = float(best_cut)
         notes = f"maximised balanced accuracy ({best_score:.4f}) over {len(observed_utilities)} observations"
     else:
-        # One-class case: fall back to a stated quantile rather than a magic constant.
-        tau_u = float(_quantile(list(observed_utilities), 0.5))
+        # One-class case.  ``median`` (the original policy) puts tau inside the observed range,
+        # so when every observation was HARMFUL half of the harmful-looking candidates would
+        # still be accepted.  ``conservative`` places tau just outside the observed range on the
+        # side the evidence supports: above every harmful observation (merge only what scores
+        # better than anything that has hurt), or at the lowest beneficial one.
+        policy = str(config.get("one_class_policy") or "median")
+        if policy == "median":
+            tau_u = float(_quantile(list(observed_utilities), 0.5))
+            rule = f"the median of {len(observed_utilities)} observed utilities"
+        elif policy == "conservative":
+            if harmful:
+                top = max(observed_utilities)
+                tau_u = float(top + max(1e-6, abs(top) * 1e-6))
+                rule = f"just above the maximum of {len(observed_utilities)} harmful observations"
+            else:
+                tau_u = float(min(observed_utilities))
+                rule = f"the minimum of {len(observed_utilities)} beneficial observations"
+        else:
+            raise ThresholdNotSelectedError(
+                f"manager.threshold.one_class_policy must be 'median' or 'conservative', got {policy!r}"
+            )
         notes = (
-            f"only {'beneficial' if beneficial else 'harmful'} observations available; used the "
-            f"median of {len(observed_utilities)} observed utilities"
+            f"only {'beneficial' if beneficial else 'harmful'} observations available; "
+            f"one_class_policy={policy}: used {rule}"
         )
 
     # REUSE demands strictly more evidence than FUSE, so tau_reuse sits above tau_u at a

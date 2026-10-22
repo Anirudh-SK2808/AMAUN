@@ -70,6 +70,8 @@ class TrainingConfig:
     early_stopping_patience: int | None
     eval_every_steps: int | None
     log_every_steps: int
+    # Size of the periodic VALIDATION-loss check.  None keeps the original cap of 8 batches.
+    intermediate_eval_examples: int | None = None
 
     @classmethod
     def from_config(cls, section: dict[str, Any]) -> "TrainingConfig":
@@ -97,6 +99,10 @@ class TrainingConfig:
             ),
             eval_every_steps=int(section["eval_every_steps"]) if section.get("eval_every_steps") else None,
             log_every_steps=int(section["log_every_steps"]),
+            intermediate_eval_examples=(
+                int(section["intermediate_eval_examples"])
+                if section.get("intermediate_eval_examples") else None
+            ),
         )
 
 
@@ -122,6 +128,8 @@ class TrainingRecord:
     examples_seen: int = 0
     trainable_parameters: int = 0
     peak_memory_bytes: int | None = None
+    #: Allocator snapshots before/after this adapter (amaun.utils.resources.memory_snapshot).
+    memory: dict[str, Any] = field(default_factory=dict)
     early_stopped: bool = False
     backbone_fingerprint_before: str = ""
     backbone_fingerprint_after: str = ""
@@ -151,7 +159,7 @@ def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainingConfig, tota
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def evaluate_loss(model: Any, loader: GuardedLoader, device: str, *, max_batches: int | None = None) -> float:
     """Mean masked CE over a loader.  Used for early stopping and for ``L_val`` features."""
     model.eval()
@@ -192,6 +200,15 @@ def train_adapter(
     seed = derive_seed(resolved.seed, adapter_id)
     set_all_seeds(seed)
 
+    from amaun.utils.profiling import reset_peak_memory
+    from amaun.utils.resources import memory_snapshot
+
+    # Peak memory is reported PER ADAPTER.  Without a reset, CUDA's max_memory_allocated is the
+    # high-water mark of the whole process, so every adapter after the first reported the
+    # largest peak seen so far rather than its own.
+    reset_peak_memory(backbone.device)
+    memory_before = memory_snapshot(backbone.device, label=f"train:{adapter_id}:before")
+
     fingerprint_before = backbone.fingerprint
     # One injection per backbone (see adapters.lora.ensure_lora); independence comes from
     # re-initialising the factors under a seed derived from this adapter's id, plus a fresh
@@ -224,6 +241,7 @@ def train_adapter(
         val_loader = GuardedLoader(
             guard, SplitName.VALIDATION, task, backbone.tokenizer,
             BatchPlan(batch_size=train_cfg.batch_size, shuffle=False, seed=seed),
+            max_examples=train_cfg.intermediate_eval_examples,
         )
 
     batches_per_epoch = max(1, len(train_loader))
@@ -251,6 +269,7 @@ def train_adapter(
                 "weight_decay": train_cfg.weight_decay,
                 "max_grad_norm": train_cfg.max_grad_norm,
                 "gradient_checkpointing": train_cfg.gradient_checkpointing,
+                "intermediate_eval_examples": train_cfg.intermediate_eval_examples,
             },
             "run_mode": resolved.run_mode.value,
             "backbone": resolved.backbone.model_id,
@@ -276,6 +295,7 @@ def train_adapter(
             logits = peft_model(input_ids=batch.input_ids, attention_mask=batch.attention_mask).logits
             loss = masked_cross_entropy(logits, batch.labels)
             (loss / train_cfg.gradient_accumulation_steps).backward()
+            del logits   # the graph is freed by backward(); drop the activation handle too
 
             record.tokens_seen += int(batch.attention_mask.sum())
             record.examples_seen += len(batch)
@@ -307,7 +327,10 @@ def train_adapter(
                     and train_cfg.eval_every_steps
                     and step % train_cfg.eval_every_steps == 0
                 ):
-                    val_loss = evaluate_loss(peft_model, val_loader, device, max_batches=8)
+                    val_loss = evaluate_loss(
+                        peft_model, val_loader, device,
+                        max_batches=None if train_cfg.intermediate_eval_examples else 8,
+                    )
                     record.validation_trajectory.append({"step": step, "val_loss": val_loss})
                     if val_loss < best_val - 1e-6:
                         best_val = val_loss
@@ -353,9 +376,13 @@ def train_adapter(
     # train_adapter calls in the same process (bootstrap_repository trains 6+ in sequence)
     # accumulate a rising memory high-water-mark even though each adapter's optimiser state is
     # unreachable after this function returns. Drop the reference and reclaim explicitly.
-    del optimizer
+    del optimizer, scheduler, params
     if device == "mps":
         torch.mps.empty_cache()
+    record.memory = {
+        "before": memory_before,
+        "after": memory_snapshot(device, label=f"train:{adapter_id}:after"),
+    }
 
     log.info(
         "[%s] done: %d steps, final loss %s, %.1fs, backbone unchanged",

@@ -73,6 +73,9 @@ def _synthetic_example(spec: TaskSpec, index: int, seed: int) -> Example:
     elif spec.task_type is TaskType.LONG_FORM_GENERATION:
         values = [f"why does {_words(rng, 3)} happen"]
         target = _words(rng, rng.randint(40, 90))
+    elif spec.task_type is TaskType.SENTIMENT_CLASSIFICATION:
+        values = [_words(rng, rng.randint(40, 90))]
+        target = rng.choice(("positive", "negative"))
     else:  # DOMAIN_GENERATION
         values = [_words(rng, rng.randint(30, 60)), f"compute {_words(rng, 2)}"]
         target = _words(rng, rng.randint(8, 25))

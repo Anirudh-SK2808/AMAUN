@@ -76,6 +76,41 @@ def _svd_factorize(delta: torch.Tensor, rank: int) -> tuple[torch.Tensor, torch.
     return a, b, error
 
 
+def _svd_factorize_lowrank(layer: LayerDelta, rank_target: int) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """Exactly what :func:`_svd_factorize` computes on ``layer.dense()``, without materialising it.
+
+    ``Delta = s B A`` with ``B: [d_out, k]``, ``A: [k, d_in]`` and ``k`` small (the concatenated
+    rank, 2r for pairwise fusion).  With ``sB = Q_b R_b`` and ``A^T = Q_a R_a``:
+
+        Delta = Q_b (R_b R_a^T) Q_a^T,   R_b R_a^T = U' S V'^T   =>   U = Q_b U',  V = Q_a V'
+
+    so the singular values and the rank-r truncation are the dense SVD's, at O((d_out+d_in) k^2)
+    instead of O(d_out d_in min(d_out, d_in)).  At 1.5B scale the dense form dominated fusion wall
+    time (~75 s of CPU SVD per fusion over 196 layers).  The relative Frobenius error is computed
+    from the discarded singular values, which equals ``||Delta - B_r A_r|| / ||Delta||`` exactly.
+    Singular vectors are unique only up to sign, so factors may differ from the dense path by a
+    per-component sign; their product -- the only thing AMAUN uses -- does not.
+    """
+    b_scaled = layer.scaling * layer.B.to(torch.float32)
+    q_b, r_b = torch.linalg.qr(b_scaled)
+    q_a, r_a = torch.linalg.qr(layer.A.to(torch.float32).T)
+    u_core, s, vh_core = torch.linalg.svd(r_b @ r_a.T, full_matrices=False)
+    rank = min(rank_target, int(s.numel()))
+    root = torch.sqrt(s[:rank])
+    b = (q_b @ u_core[:, :rank]) * root.unsqueeze(0)
+    a = root.unsqueeze(1) * (vh_core[:rank, :] @ q_a.T)
+    # The dense SVD returns min(target, min(shape)) components even when the concatenated rank is
+    # smaller (the extras have ~zero singular values).  Pad with exact zeros to the same rank, so
+    # the factor shapes -- which must match the model's LoRA rank to be installed -- are identical.
+    padded = min(int(rank_target), min(layer.shape))
+    if padded > rank:
+        b = torch.cat([b, b.new_zeros(b.shape[0], padded - rank)], dim=1)
+        a = torch.cat([a, a.new_zeros(padded - rank, a.shape[1])], dim=0)
+    total = float(torch.sum(s * s))
+    error = float(torch.sqrt(torch.sum(s[rank:] ** 2) / total)) if total > 0 else 0.0
+    return a, b, error
+
+
 def fuse_to_delta(
     components: Sequence[AdapterDelta],
     alphas: dict[str, torch.Tensor] | list[float],
@@ -100,7 +135,10 @@ def fuse_to_delta(
 
     layers: dict[str, LayerDelta] = {}
     for key, layer in exact.items():
-        a, b, error = _svd_factorize(layer.dense(), target_rank)
+        if layer.rank < min(layer.shape):
+            a, b, error = _svd_factorize_lowrank(layer, target_rank)
+        else:
+            a, b, error = _svd_factorize(layer.dense(), target_rank)
         layers[key] = LayerDelta(A=a, B=b, scaling=1.0)
         report.per_layer_relative_error[key] = error
     return AdapterDelta(layers=layers, adapter_id=exact.adapter_id), report
