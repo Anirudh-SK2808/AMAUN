@@ -18,7 +18,7 @@ from amaun.data.preprocess import collate, encode_prompt, masked_cross_entropy
 from amaun.data.registry import TaskSpec
 from amaun.data.splits import Example, SplitAccessGuard, SplitName
 from amaun.errors import EvaluationError, SplitAccessViolation
-from amaun.evaluation.task_metrics import compute_all
+from amaun.evaluation.task_metrics import compute_with_examples
 from amaun.models.generation import GenerationConfig
 from amaun.utils.logging import get_logger
 
@@ -37,6 +37,9 @@ class EvaluationResult:
     wall_seconds: float
     generation_config: dict[str, Any] = field(default_factory=dict)
     sample_predictions: list[dict[str, str]] = field(default_factory=list)
+    #: Every example's prediction, reference and per-metric scores (l4_full_study item 10), in
+    #: split order, so paired comparisons and bootstrap CIs can be computed later.
+    per_example: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         from dataclasses import asdict
@@ -55,12 +58,15 @@ class Evaluator:
         max_examples: int | None = None,
         batch_size: int = 4,
         keep_samples: int = 3,
+        scorers: dict[str, Any] | None = None,
     ) -> None:
         self.backbone = backbone
         self.generation = generation
         self.max_examples = max_examples
         self.batch_size = batch_size
         self.keep_samples = keep_samples
+        #: Model-based metrics (e.g. ``{"bertscore_f1": BERTScorer}``), shared by every arm.
+        self.scorers = dict(scorers or {})
 
     @torch.no_grad()
     def evaluate(
@@ -71,16 +77,21 @@ class Evaluator:
         model: Any,
         adapter_id: str | None,
         split: SplitName | str = SplitName.TEST,
+        max_examples: int | None = None,
     ) -> EvaluationResult:
-        """Evaluate whatever adapter is currently installed on ``model``."""
+        """Evaluate whatever adapter is currently installed on ``model``.
+
+        ``max_examples`` overrides the evaluator's cap for this call (per-task TEST sizes).
+        """
         if SplitName(split) not in guard.permitted:
             raise SplitAccessViolation(
                 f"evaluator was given a guard permitting "
                 f"{sorted(p.value for p in guard.permitted)}, not '{SplitName(split).value}'"
             )
         examples: list[Example] = list(guard.get(split))
-        if self.max_examples is not None:
-            examples = examples[: self.max_examples]
+        cap = max_examples if max_examples is not None else self.max_examples
+        if cap is not None:
+            examples = examples[:cap]
         if not examples:
             raise EvaluationError(f"task '{task.task_id}' has no examples in split '{split}'")
 
@@ -106,11 +117,15 @@ class Evaluator:
             logits = model(input_ids=batch.input_ids, attention_mask=batch.attention_mask).logits
             losses.append(float(masked_cross_entropy(logits, batch.labels)))
 
-            for example in chunk:
-                predictions.append(self._generate_one(model, task, example))
+            if self.generation.batch_size <= 1:
+                for example in chunk:
+                    predictions.append(self._generate_one(model, task, example))
+        if self.generation.batch_size > 1:
+            predictions = self._generate_batched(model, task, examples)
 
         mean_loss = sum(losses) / len(losses) if losses else None
-        metrics = compute_all(task.metrics, predictions, references, mean_token_loss=mean_loss)
+        metrics, per_metric = compute_with_examples(task.metrics, predictions, references,
+                                                    mean_token_loss=mean_loss, scorers=self.scorers)
         if task.primary_score not in metrics:
             raise EvaluationError(
                 f"task '{task.task_id}' declares primary_score='{task.primary_score}' but the "
@@ -133,7 +148,46 @@ class Evaluator:
                 {"prompt": e.prompt[:200], "reference": r[:200], "prediction": p[:200]}
                 for e, r, p in list(zip(examples, references, predictions))[: self.keep_samples]
             ],
+            per_example=[
+                {"index": i, "example_id": e.example_id, "prediction": p, "reference": r,
+                 "scores": {name: values[i] for name, values in per_metric.items()}}
+                for i, (e, r, p) in enumerate(zip(examples, references, predictions))
+            ],
         )
+
+    def _generate_batched(self, model: Any, task: TaskSpec, examples: Sequence[Example]) -> list[str]:
+        """Greedy generation ``generation.batch_size`` prompts at a time (D-026).
+
+        Prompts are encoded exactly as in :meth:`_generate_one`, ordered by length so a batch pads
+        little, left-padded (a decoder continues from the last position), and decoded per row
+        after the shared prompt width.  Predictions are returned in the examples' order.
+        """
+        tokenizer = self.backbone.tokenizer
+        device = self.backbone.device
+        pad_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = getattr(tokenizer, "eos_token_id", None)
+        if pad_id is None:
+            raise EvaluationError("batched generation needs a pad or eos token id")
+        encoded = [encode_prompt(tokenizer, e.prompt, max_input_tokens=task.max_input_tokens,
+                                 truncation=task.prompt_truncation) for e in examples]
+        kwargs = self.generation.to_kwargs(pad_token_id=pad_id,
+                                           eos_token_id=getattr(tokenizer, "eos_token_id", None))
+        kwargs["max_new_tokens"] = min(kwargs["max_new_tokens"], task.max_target_tokens)
+        order = sorted(range(len(encoded)), key=lambda i: (len(encoded[i]), i))
+        predictions: list[str | None] = [None] * len(encoded)
+        size = self.generation.batch_size
+        for begin in range(0, len(order), size):
+            rows = order[begin : begin + size]
+            width = max(len(encoded[i]) for i in rows)
+            input_ids = torch.tensor([[pad_id] * (width - len(encoded[i])) + encoded[i] for i in rows],
+                                     dtype=torch.long, device=device)
+            attention = torch.tensor([[0] * (width - len(encoded[i])) + [1] * len(encoded[i]) for i in rows],
+                                     dtype=torch.long, device=device)
+            output = model.generate(input_ids=input_ids, attention_mask=attention, **kwargs)
+            for row, index in enumerate(rows):
+                predictions[index] = tokenizer.decode(output[row][width:], skip_special_tokens=True).strip()
+        return [p if p is not None else "" for p in predictions]
 
     def _generate_one(self, model: Any, task: TaskSpec, example: Example) -> str:
         tokenizer = self.backbone.tokenizer

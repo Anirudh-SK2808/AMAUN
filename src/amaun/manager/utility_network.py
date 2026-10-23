@@ -102,11 +102,24 @@ class UtilityNetwork(nn.Module):
             "orientation",
             torch.tensor([HEAD_ORIENTATION[head] for head in self.heads], dtype=torch.float32),
         )
+        # Target standardisation (l4_full_study item 12).  Identity unless the network was trained
+        # with ``normalize_targets``: then the heads predict z-scores on the fit split, so a head in
+        # MB (memory) cannot dominate the L2 loss through its units, and ``psi`` sees comparable
+        # magnitudes.  ``predict_outcomes_raw`` maps back to measured units.
+        self.register_buffer("target_mean", torch.zeros(len(self.heads)))
+        self.register_buffer("target_std", torch.ones(len(self.heads)))
 
     # -- forward -----------------------------------------------------------------
     def predict_outcomes(self, z: torch.Tensor) -> torch.Tensor:
         """``u_hat`` -- the raw predicted post-integration outcomes."""
         return self.head(self.trunk(z))
+
+    def predict_outcomes_raw(self, z: torch.Tensor) -> torch.Tensor:
+        """Predicted outcomes in the targets' measured units."""
+        return self.predict_outcomes(z) * self.target_std + self.target_mean
+
+    def standardise_targets(self, targets: torch.Tensor) -> torch.Tensor:
+        return (targets - self.target_mean) / self.target_std
 
     def scalar_weights(self) -> torch.Tensor:
         if not self.cfg.monotone_weights:
@@ -169,7 +182,11 @@ class UtilityNetwork(nn.Module):
             monotone_weights=payload["config"]["monotone_weights"],
         )
         model = cls(payload["input_dim"], cfg)
-        model.load_state_dict(payload["state_dict"])
+        state = dict(payload["state_dict"])
+        # Networks saved before target standardisation existed carry no statistics: identity.
+        state.setdefault("target_mean", model.target_mean)
+        state.setdefault("target_std", model.target_std)
+        model.load_state_dict(state)
         return model, list(payload.get("feature_names", []))
 
 
@@ -180,6 +197,10 @@ class UtilityTrainingRecord:
     n_samples: int = 0
     final_loss: float | None = None
     per_head_final_mse: dict[str, float] = field(default_factory=dict)
+    #: True when targets were z-scored on the fit split; MSEs above are then in z units.
+    targets_standardised: bool = False
+    target_mean: list[float] = field(default_factory=list)
+    target_std: list[float] = field(default_factory=list)
     fit_split: str = ""
     run_mode: str = ""
 
@@ -230,6 +251,16 @@ def train_utility_network(
     record = UtilityTrainingRecord(
         n_samples=int(features.shape[0]), fit_split=fit_split, run_mode=run_mode
     )
+    if bool(config.get("normalize_targets", False)):
+        with torch.no_grad():
+            mean = targets.mean(dim=0)
+            std = targets.std(dim=0, unbiased=False)
+            model.target_mean.copy_(mean)
+            model.target_std.copy_(torch.where(std > 1e-12, std, torch.ones_like(std)))
+        record.targets_standardised = True
+        record.target_mean = model.target_mean.tolist()
+        record.target_std = model.target_std.tolist()
+    targets = model.standardise_targets(targets)
     model.train()
     count = features.shape[0]
     for epoch in range(epochs):

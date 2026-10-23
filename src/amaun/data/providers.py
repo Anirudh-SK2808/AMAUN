@@ -38,6 +38,8 @@ _VOCAB = (
 
 
 def _rng_for(task_id: str, index: int, seed: int) -> random.Random:
+    """``task_id`` is the stream key: a duplicate task passes its original's id, so it draws from
+    the same synthetic stream (TEST rows identical, training rows at disjoint indices)."""
     digest = hashlib.sha256(f"{task_id}|{index}|{seed}".encode()).digest()
     return random.Random(int.from_bytes(digest[:8], "big"))
 
@@ -46,7 +48,7 @@ def _words(rng: random.Random, count: int) -> str:
     return " ".join(rng.choice(_VOCAB) for _ in range(count))
 
 
-def _synthetic_example(spec: TaskSpec, index: int, seed: int) -> Example:
+def _synthetic_example(spec: TaskSpec, index: int, seed: int, stream_key: str | None = None) -> Example:
     """One deterministic pseudo-example whose shape matches the task type.
 
     The generated values are positional and are bound to the task's **declared**
@@ -55,7 +57,7 @@ def _synthetic_example(spec: TaskSpec, index: int, seed: int) -> Example:
     ``context``, ``longform``'s ``question`` -> ELI5's ``title`` -- must not silently break the
     offline ``dummy`` tier.
     """
-    rng = _rng_for(spec.task_id, index, seed)
+    rng = _rng_for(stream_key or spec.task_id, index, seed)
     if spec.task_type is TaskType.SUMMARIZATION:
         values = [_words(rng, rng.randint(60, 120))]
         target = _words(rng, rng.randint(10, 20))
@@ -76,6 +78,12 @@ def _synthetic_example(spec: TaskSpec, index: int, seed: int) -> Example:
     elif spec.task_type is TaskType.SENTIMENT_CLASSIFICATION:
         values = [_words(rng, rng.randint(40, 90))]
         target = rng.choice(("positive", "negative"))
+    elif spec.task_type is TaskType.NAMED_ENTITY_RECOGNITION:
+        words = _words(rng, rng.randint(6, 14)).split()
+        picked = sorted(rng.sample(range(len(words)), k=rng.randint(0, 2)))
+        values = [" ".join(words)]
+        lines = [f"{rng.choice(('PER', 'ORG', 'LOC', 'MISC'))}: {words[i]}" for i in picked]
+        target = "\n".join(lines) if lines else "none"
     else:  # DOMAIN_GENERATION
         values = [_words(rng, rng.randint(30, 60)), f"compute {_words(rng, 2)}"]
         target = _words(rng, rng.randint(8, 25))
@@ -109,8 +117,9 @@ def render_prompt(spec: TaskSpec, fields: dict[str, Any]) -> str:
         ) from exc
 
 
-def synthetic_pool(spec: TaskSpec, size: int, *, seed: int, offset: int = 0) -> list[Example]:
-    return [_synthetic_example(spec, offset + i, seed) for i in range(size)]
+def synthetic_pool(spec: TaskSpec, size: int, *, seed: int, offset: int = 0,
+                   stream_key: str | None = None) -> list[Example]:
+    return [_synthetic_example(spec, offset + i, seed, stream_key) for i in range(size)]
 
 
 SAMPLING_POLICIES = ("head_of_stream", "shuffled_buffer")
@@ -194,6 +203,7 @@ def huggingface_pool(
     offline_snapshots: bool,
     cache_dir: str | None = None,
     skip: int = 0,
+    shuffle_key: str | None = None,
 ) -> tuple[list[Example], LoadReport]:
     """Load at most ``size`` examples from a pinned HF dataset split.
 
@@ -237,6 +247,7 @@ def huggingface_pool(
         row_adapter=str(row_adapter.name),
         row_adapter_options=options,
         required_fields=required_fields,
+        shuffle_key=shuffle_key if shuffle_key and shuffle_key != spec.task_id else None,
     )
     snapshot_path = (
         snapshots.path_for(cache_dir, spec.task_id, snapshot_spec) if cache_dir else None
@@ -261,6 +272,7 @@ def huggingface_pool(
             spec, size=size, split=split, skip=skip, sampling=sampling,
             shuffle_buffer_size=shuffle_buffer_size, data_seed=data_seed,
             row_adapter=row_adapter, options=options, required_fields=required_fields,
+            shuffle_key=shuffle_key or spec.task_id,
         )
 
     # Adapt the (raw, field-restricted) rows identically whether they came from the Hub or from
@@ -357,6 +369,7 @@ def _stream_rows(
     row_adapter: Any,
     options: dict[str, Any],
     required_fields: tuple[str, ...],
+    shuffle_key: str,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Stream, shuffle, skip, and collect just enough raw rows to fill ``size`` examples."""
     from datasets import load_dataset
@@ -375,7 +388,7 @@ def _stream_rows(
     )
     if sampling == "shuffled_buffer":
         dataset = dataset.shuffle(
-            seed=derive_shuffle_seed(data_seed, spec.task_id),
+            seed=derive_shuffle_seed(data_seed, shuffle_key),
             buffer_size=int(shuffle_buffer_size),
         )
     if skip:

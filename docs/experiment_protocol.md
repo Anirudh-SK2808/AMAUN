@@ -173,3 +173,24 @@ other budget matches.
 
 Estimated `actual` cost is `[TO BE FIXED EXPERIMENTALLY]`; the runner logs measured wall
 time and tokens so the estimate is replaced by measurement after the first arm.
+
+## 10. l4_full_study (one-run decision study, `local_smoke`)
+
+Specification: `docs/l4_next_run_prompt.md`; requirements and design: `specs/l4_full_study/`;
+decisions: D-017 – D-024. Config: `configs/experiments/l4_full_study.yaml`; entry point:
+`scripts/run_full_study.py [--resume]`. NON-REPORTABLE (`local_smoke`, one seed).
+
+- **Split discipline.** Phases 1–4 and every policy decision read TRAIN / VALIDATION / SUPPORT
+  only. Fusion config, τ_u, the reuse gate, the fixed-rule threshold, tolerances and top-k are
+  frozen at the end of Phase 4, before any evaluation task's TEST split is read. Each evaluation
+  task's eligibility check runs on VALIDATION, and its decisions are logged before its first TEST
+  read. Each configuration is scored on TEST once (results are cached, never re-drawn).
+- **Run-1 reuse.** seed-sum / seed-qa / seed-sentiment are loaded, not retrained; preflight
+  proves their splits are reproduced (D-022) and the content-hash leakage audit covers every task,
+  including the duplicates.
+- **Judgement.** Acceptability, oracle and decision quality per D-018; labels per D-019; the
+  `amaun` order per D-020.
+- **Statistics.** One seed: CIs are paired bootstraps over TEST examples (1 000 resamples), which
+  measure example sampling noise only, not seed variance (D-024).
+- **Resume.** A restart resumes from the last completed unit; resumes are recorded in the
+  summary and the results document.

@@ -46,9 +46,15 @@ class SnapshotSpec:
     row_adapter: str
     row_adapter_options: Mapping[str, Any]
     required_fields: Sequence[str]
+    #: Task whose shuffle order the load follows, when not the loading task itself (a duplicate
+    #: task such as ``qa-B`` reads ``qa``'s stream).  Keyed only when set, so every existing
+    #: snapshot key -- including run 1's, which l4_full_study verifies -- is unchanged.
+    shuffle_key: str | None = None
 
     def as_key_payload(self) -> dict[str, Any]:
+        extra = {"shuffle_key": self.shuffle_key} if self.shuffle_key else {}
         return {
+            **extra,
             "schema_version": SNAPSHOT_SCHEMA_VERSION,
             "hf_id": self.hf_id,
             "hf_revision": self.hf_revision,

@@ -235,3 +235,56 @@ datasets:
       row_adapter_options:
         labels: {0: negative, 1: positive}
       row_adapter_reason: "IMDb label 0/1 rendered as the words negative/positive"
+
+    # Opt-in tasks for configs/experiments/l4_full_study.yaml (D-021).  Revisions resolved from the
+    # Hub API on 2026-10-23; re-verify on the run host before the run (`--prepare-only`).
+    xsum:
+      task_name: Extreme Summarization
+      task_type: summarization
+      description: "Single-sentence news summarization over XSum (BBC); related to `sum`."
+      hf_id: EdinburghNLP/xsum
+      hf_revision: 7d4d486c2f8ef850b1a11aead99b894ff3dd7da9
+      hf_config: null
+      pinned: true
+      license: "unknown (dataset card); BBC articles, research use"
+      license_notes: "Re-verify at download time. Article text is not redistributable."
+      primary_score: rougeL
+      metrics: [rouge1, rouge2, rougeL]
+      input_fields: [document]
+      target_field: summary
+      prompt_template: "Summarize the following article in one sentence.\n\nArticle:\n{document}\n\nSummary:"
+      max_input_tokens: 512
+      max_target_tokens: 64
+      prompt_truncation: middle
+      upstream_test_source: "upstream 'test' split (11 334 rows)"
+      row_adapter: passthrough
+      row_adapter_options:
+        list_target_pick: first         # `summary` is a plain string
+
+    ner:
+      task_name: Named Entity Recognition
+      task_type: named_entity_recognition
+      description: "CoNLL-2003 English NER as generation: sentence -> 'TYPE: span' lines (unlike every seed task)."
+      hf_id: eriktks/conll2003
+      # `main` holds only a loading script (conll2003.py), so -- as for dialog / domain (FR-2.6) --
+      # pinned to the parquet conversion plus its resolved commit.
+      hf_revision: refs/convert/parquet
+      hf_revision_resolved: ce85b39f9dd99f552d0739d456814e95fb6a39b0
+      hf_config: null                 # the parquet conversion exposes only 'default' (as dialog / domain)
+      pinned: true
+      license: "other (CoNLL-2003 / Reuters RCV1 research terms)"
+      license_notes: "Reuters text is under the RCV1 research agreement; do not redistribute."
+      primary_score: entity_f1
+      metrics: [entity_f1, entity_f1_micro]
+      input_fields: [sentence]
+      target_field: ner_tags
+      prompt_template: "List the named entities in the sentence, one per line as TYPE: span, using the types PER, ORG, LOC and MISC. Answer none if there are none.\n\nSentence: {sentence}\n\nEntities:"
+      max_input_tokens: 256
+      max_target_tokens: 64
+      upstream_test_source: "upstream 'test' split (3 453 rows)"
+      row_adapter: conll_entities
+      row_adapter_options:
+        tag_names: [O, B-PER, I-PER, B-ORG, I-ORG, B-LOC, I-LOC, B-MISC, I-MISC]   # the dataset's ClassLabel order
+        empty_target: none
+        skip_tokens: ["-DOCSTART-"]
+      row_adapter_reason: "D-021: BIO tags -> exact (type, span) lines; I- continues only a same-type entity"

@@ -1,0 +1,357 @@
+# The full AMAUN decision study -- one resumable run on one L4 (budget 32 h; merged, batched
+# evaluation per D-026 -- one-at-a-time LoRA decoding projected 78 h).
+# Specification: docs/l4_next_run_prompt.md.  Requirements / design: specs/l4_full_study/.
+# Decisions: docs/decision_register.md D-017 - D-024.
+#
+#   .venv/bin/python scripts/run_full_study.py --config configs/experiments/l4_full_study.yaml \
+#       --run-mode local_smoke                 # first launch
+#   ... same command with --resume              # after any VM restart
+#
+# RUN MODE local_smoke (Qwen2.5-1.5B-Instruct): NON-REPORTABLE, one seed.  Like
+# l4_decision_study.yaml this file does not include experiments/base.yaml (its local_smoke overlay
+# is tuned for Apple-Silicon MPS and would replace the values below).
+#
+# DATA INTEGRITY.  seed-sum / seed-qa / seed-sentiment are loaded from run 1, so the data config of
+# sum, qa and sentiment below is byte-identical to l4_decision_study.yaml (seed 1234, 9 000-row
+# pools, 80/10/10, 6 000 / 750 / 750 / 300, buffer 25 000).  Preflight proves it against run 1's
+# artefacts (full_study.reference_run, D-022) and refuses to start otherwise.
+includes:
+  - model/qwen.yaml
+  - training/default.yaml
+  - datasets/curriculum.yaml
+  - fusion/learnable_layerwise.yaml
+  - utility/default.yaml
+  - federated/default.yaml
+
+experiment_id: l4_full_study
+
+experiment:
+  seeds: [1234]                 # ONE seed; must stay 1234 (the reused adapters' splits depend on it)
+  deterministic: true           # torch deterministic algorithms, fixed cuBLAS workspace (D-023)
+  budget_tolerance: 0.05
+  allow_unequal_budget: false
+  allow_dirty_git: false
+  evaluate_every_task: true
+
+curriculum:
+  repository_init: bootstrap_six
+  seed_tasks: [sum, qa, sentiment, qa-B, instr, dialog]
+  evaluated_stream: [domain, sentiment-B, xsum, longform, ner]
+
+evaluation:
+  max_test_examples: 300        # per-task sizes: full_study.test_examples
+  # D-026: every generating evaluation runs with the adapter merged into the base weights (2x faster
+  # greedy decoding on the L4); base weights are restored exactly from a pristine CPU copy.
+  merged_weights: true
+  evaluate_unseen_for_fwt: false
+  # ELI5's primary metric (D-021): rescaled BERTScore-F1, bert_score 0.3.13 defaults for roberta-large.
+  bertscore:
+    model_id: FacebookAI/roberta-large
+    revision: 722cf37b1afa9454edce342e7895e588b6ff1d59
+    num_layers: 17
+    rescale_with_baseline: true
+    baseline_f: 0.83122575      # bert_score 0.3.13 rescale_baseline/en/roberta-large.tsv, layer 17, F
+    batch_size: 16
+    max_length: 512
+    cache_dir: data/models
+    local_files_only: true      # cached by scripts/fetch_bertscore_model.py; preflight checks it loads
+
+generation:
+  # Per-task max_new_tokens = the task's max_target_tokens (the evaluator takes the minimum), so the
+  # global cap is the largest target (ELI5, 512).  Greedy decoding for every option.
+  max_new_tokens: 512
+  # D-026: 4 prompts per generate call, left-padded and grouped by prompt length (with merged weights,
+  # 4-6x faster than one at a time on the L4).  Batch 8 shifted a long-output score too far to adopt.
+  batch_size: 4
+
+model:
+  device: auto
+  quantization: none
+
+data:
+  provider: huggingface
+  sampling: shuffled_buffer
+  shuffle_buffer_size: 25000
+  smoke_max_examples_per_split: null
+  split_ratios: {train: 0.80, validation: 0.10, support: 0.10}
+  split_caps:
+    train: 6000
+    validation: 750
+    support: 750
+    test: 300
+  split_caps_strict: true
+  content_audit: true           # cross-task leakage audit on content hashes (item 23)
+  # FinQA: 6 203 usable rows, 6 156 distinct (47 repeated upstream rows; exact mode keeps one copy),
+  # so exact counts 5 656 + 250 + 250 instead of ratios (D-021).
+  task_split_counts:
+    domain: {train: 5656, validation: 250, support: 250}
+  task_split_caps:
+    domain: {train: 5656, validation: 250, support: 250}
+  volumes:
+    sum:         {train_pool: 9000, test: 300, test_split: validation}
+    qa:          {train_pool: 9000, test: 300, test_split: validation}
+    sentiment:   {train_pool: 9000, test: 300, test_split: test}
+    # Duplicates: the original's shuffled stream after its 9 000-row pool (train_offset), minus any
+    # content hash in the original's pool or TEST; TEST rows identical to the original's.
+    qa-B:        {train_pool: 9000, test: 300, test_split: validation, train_offset: 9000}
+    sentiment-B: {train_pool: 9000, test: 300, test_split: test, train_offset: 9000}
+    instr:       {train_pool: 9000, test: 300, test_split: train, test_offset: 9000}
+    dialog:      {train_pool: 9000, test: 300, test_split: validation}
+    xsum:        {train_pool: 9000, test: 300, test_split: test}
+    longform:    {train_pool: 9000, test: 300, test_split: validation}
+    domain:      {train_pool: 6251, test: 300, test_split: test}
+    ner:         {train_pool: 9000, test: 300, test_split: test}
+
+datasets:
+  order: [sum, qa, sentiment, qa-B, sentiment-B, instr, dialog, xsum, longform, domain, ner]
+  tasks:
+    # sum / qa / sentiment / longform / domain: exactly run 1's overrides.
+    sum:       {max_input_tokens: 512, max_target_tokens: 128, prompt_truncation: middle}
+    domain:    {max_input_tokens: 768, max_target_tokens: 128, prompt_truncation: middle}
+    qa:        {prompt_truncation: middle}
+    sentiment: {prompt_truncation: middle}
+    longform:
+      prompt_truncation: middle
+      primary_score: bertscore_f1
+      metrics: [bertscore_f1, rougeL, perplexity]
+    qa-B:        {duplicate_of: qa}
+    sentiment-B: {duplicate_of: sentiment}
+    instr:     {prompt_truncation: middle, metrics: [rougeL]}
+    dialog:    {prompt_truncation: middle}
+    ner:       {prompt_truncation: middle}
+
+training:
+  epochs: 1.0                   # 6 000 rows / batch 4 / accumulation 4 = 375 steps (FinQA 353)
+  max_steps: null
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  gradient_checkpointing: true
+  early_stopping_patience: null
+  eval_every_steps: 125
+  intermediate_eval_examples: 16
+  log_every_steps: 25
+
+task_repr:
+  max_support_examples: 32
+
+features:
+  semantic:
+    hidden_probe_examples: 16
+  gradient:
+    reference_batch_size: 4
+  performance:
+    max_eval_examples: 16
+
+# The base fusion setting is the most memory-hungry grid entry (keep_components, free alpha, KD on),
+# so run 1's per-task preflight fusion step checks it at every task's longest batch (item 27).
+fusion:
+  coefficient:
+    parameterisation: free
+    granularity: layerwise
+    init_value: 1.0
+    learning_rate: 1.0e-2
+  storage: keep_components
+  steps: 100
+
+kd:
+  lambda: 0.1
+  retention_examples: 16
+
+utility:
+  training:
+    normalize_targets: true     # z-score every head's target on the fit split (item 12)
+  reuse_gate:
+    # Gap target is the relative MEASURED metric gap s(A_cand)/s(A_dedicated) - 1 (D-019), so the
+    # tolerance is the 2 % equivalence margin.
+    tolerance: 0.02
+
+manager:
+  decision_order: prescreen_then_train
+  retrieval:
+    mode: single
+    k: 1
+  threshold:
+    selection: dev_stream
+    one_class_policy: conservative
+  similarity:
+    feature: semantic.d_task_sq
+    higher_is_more_similar: false
+
+repository:
+  max_bytes: null
+
+federated:
+  enabled: false
+
+decision_study:
+  required_backbone: Qwen/Qwen2.5-1.5B-Instruct
+  time_budget_hours: 32
+  initial_adapters:
+    - {adapter_id: seed-sum,       task: sum,       role: "run-1 adapter (loaded)"}
+    - {adapter_id: seed-qa,        task: qa,        role: "run-1 adapter (loaded)"}
+    - {adapter_id: seed-sentiment, task: sentiment, role: "run-1 adapter (loaded)"}
+    - {adapter_id: seed-qa-B,      task: qa-B,      role: "same-task duplicate of seed-qa"}
+    - {adapter_id: seed-instr,     task: instr,     role: "instruction following"}
+    - {adapter_id: seed-dialog,    task: dialog,    role: "dialogue"}
+  evaluation_tasks:
+    - {task: domain,      kind: different, related_to: null}
+    - {task: sentiment-B, kind: similar,   related_to: seed-sentiment}
+    - {task: xsum,        kind: similar,   related_to: seed-sum}
+    - {task: longform,    kind: similar,   related_to: seed-sum}
+    - {task: ner,         kind: different, related_to: null}
+  policies: [always_merge, always_separate, fixed_rule]   # run-1 names; the full list is full_study.policies
+  always_merge:
+    feature: semantic.d_task_sq
+    higher_is_more_similar: false
+  supervision_loss_examples: 750
+  supervision_generation_examples: 16
+  retention_split: train
+  outcome_tolerance: 0.01
+  min_supervision_examples: 20
+  evaluate_zero_shot: true
+  measure_all_options: true
+  preflight: true
+  memory_audit:
+    cycles: 3
+    fusion_steps: 2
+    eval_examples: 16
+    allocated_tolerance_mb: 32
+    tensor_tolerance: 8
+
+full_study:
+  reference_run: results/local_smoke/l4_decision_study
+  reference_tasks: [sum, qa, sentiment]
+  reuse_adapters:
+    dir: adapters/local_smoke/l4_decision_study
+    ids: [seed-sum, seed-qa, seed-sentiment]
+  fusion_pair_adapters: [seed-sum, seed-qa, seed-sentiment]
+  # Phase 2 grid (overrides of the fusion / kd sections above).  F-0 re-runs run 1's setting under
+  # this run's evaluation code and is never eligible for selection.
+  fusion_grid:
+    - name: F-0
+      reference: true
+      fusion: {storage: refactorize_svd, steps: 100,
+               coefficient: {parameterisation: softmax_k, init_value: 0.5}}
+      kd: {lambda: 1.0}
+    - name: F-a
+      fusion: {storage: keep_components, steps: 100,
+               coefficient: {parameterisation: softmax_k, init_value: 0.5}}
+      kd: {lambda: 0.1}
+    - name: F-b
+      fusion: {storage: keep_components, steps: 100,
+               coefficient: {parameterisation: softmax_k, init_value: 0.5}}
+      kd: {lambda: 0.0}
+    - name: F-c
+      fusion: {storage: keep_components, steps: 100,
+               coefficient: {parameterisation: free, init_value: 1.0}}
+      kd: {lambda: 0.1}
+    - name: F-e                      # B3: uniform average, no training
+      fusion: {storage: keep_components, steps: 0,
+               coefficient: {parameterisation: softmax_k, init_value: 0.5}}
+      kd: {lambda: 0.0}
+  # VALIDATION generations behind every measured label (item 9): 150 short-output, 100 long-output.
+  label_examples: {qa: 150, sentiment: 150, sum: 100, instr: 100, dialog: 100}
+  # Eligibility check sizes (item 25).
+  eligibility_examples: {domain: 150, sentiment: 150, xsum: 100, longform: 100, ner: 150}
+  # TEST sizes (Phase 5 / 6): 300 short-output, 150 long-output.  Duplicates inherit the original's.
+  test_examples: {qa: 300, sentiment: 300, domain: 300, ner: 300,
+                  sum: 150, xsum: 150, longform: 150, instr: 150, dialog: 150}
+  probe_examples: 16
+  fuse_top_k: 2
+  policies: [amaun, amaun_train_first, probe_rule, fixed_rule, always_separate, always_merge,
+             reuse_only, fuse_only]
+  caps: [null, 6]
+  utility_fit_gate: {min_pairs: 20, min_beneficial_fraction: 0.2, max_beneficial_fraction: 0.8}
+  related_groups: [[sum, xsum, longform], [qa, domain], [instr, dialog, longform]]
+  criteria: {equivalence: 0.98, forgetting: 0.01, eligibility: 0.05, bootstrap_resamples: 1000}
+  memory_limit_gb: 22.5
+  stream:
+    order: [sum, qa, sentiment, instr, dialog, qa-B, sentiment-B, xsum, longform, domain, ner]
+    policies: [amaun, always_separate]
+    caps: [null, 6]
+    reevaluate_all_each_step: false
+  projection:
+    generation_length_factor: 1.25
+    probe_decode_tokens: 16
+    fuse_options_per_task: 4
+    stream_fusions_per_run: 4
+
+run_mode_overrides:
+  # Offline wiring check for tests/test_full_study.py; never a result.
+  dummy:
+    experiment:
+      deterministic: true
+    evaluation:
+      max_test_examples: 4
+      bertscore:
+        model_id: null          # tiny random encoder built in-process (offline)
+        revision: null
+        num_layers: 2
+        batch_size: 4
+        max_length: 64
+        local_files_only: false
+    generation:
+      max_new_tokens: 4
+    data:
+      provider: synthetic
+      synthetic_pool_size: 120
+      synthetic_test_size: 8
+      split_caps: {train: 16, validation: 6, support: 6, test: 6}
+      task_split_counts:
+        domain: {train: 12, validation: 6, support: 6}
+      task_split_caps:
+        domain: {train: 12, validation: 6, support: 6}
+    training:
+      max_steps: 2
+      batch_size: 2
+      gradient_accumulation_steps: 1
+      eval_every_steps: 1
+      intermediate_eval_examples: 2
+      log_every_steps: 1
+    fusion:
+      steps: 2
+    kd:
+      retention_examples: 2
+    utility:
+      training:
+        epochs: 5
+    features:
+      semantic:
+        hidden_probe_examples: 2
+      gradient:
+        reference_batch_size: 2
+      performance:
+        max_eval_examples: 2
+    task_repr:
+      max_support_examples: 4
+    decision_study:
+      supervision_loss_examples: 4
+      supervision_generation_examples: 2
+      memory_audit:
+        cycles: 3
+        fusion_steps: 1
+        eval_examples: 2
+    full_study:
+      reference_run: null
+      reuse_adapters: null
+      fusion_grid:
+        - {name: F-0, reference: true, fusion: {storage: refactorize_svd, steps: 2,
+                                                coefficient: {parameterisation: softmax_k, init_value: 0.5}},
+           kd: {lambda: 1.0}}
+        - {name: F-a, fusion: {storage: keep_components, steps: 2,
+                               coefficient: {parameterisation: softmax_k, init_value: 0.5}}, kd: {lambda: 0.1}}
+        - {name: F-b, fusion: {storage: keep_components, steps: 2,
+                               coefficient: {parameterisation: softmax_k, init_value: 0.5}}, kd: {lambda: 0.0}}
+        - {name: F-c, fusion: {storage: keep_components, steps: 2,
+                               coefficient: {parameterisation: free, init_value: 1.0}}, kd: {lambda: 0.1}}
+        - {name: F-e, fusion: {storage: keep_components, steps: 0,
+                               coefficient: {parameterisation: softmax_k, init_value: 0.5}}, kd: {lambda: 0.0}}
+      label_examples: {qa: 3, sentiment: 3, sum: 3, instr: 3, dialog: 3}
+      eligibility_examples: {domain: 3, sentiment: 3, xsum: 3, longform: 3, ner: 3}
+      test_examples: {qa: 3, sentiment: 3, domain: 3, ner: 3, sum: 3, xsum: 3, longform: 3, instr: 3, dialog: 3}
+      probe_examples: 2
+      projection:
+        generation_length_factor: 1.25
+        probe_decode_tokens: 3
+        fuse_options_per_task: 4
+        stream_fusions_per_run: 4

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from amaun.config import ResolvedConfig, RunMode, load_config, resolve
-from amaun.data.leakage import audit
+from amaun.data.leakage import audit, content_audit
 from amaun.data.providers import huggingface_pool, synthetic_pool
 from amaun.data.registry import TaskSpec, load_curriculum
 from amaun.data.row_adapters import resolve as resolve_row_adapter
@@ -151,6 +151,7 @@ def _task_volumes(cfg_volumes: Mapping[str, Any] | None, task_id: str) -> dict[s
     test = int(volumes["test"])
     test_split = str(volumes["test_split"])
     test_offset = volumes.get("test_offset")
+    train_offset = int(volumes.get("train_offset") or 0)
     if test_split == _TRAINING_POOL_SPLIT and test_offset is None:
         raise ConfigError(
             f"data.volumes.{task_id}.test_offset is required because test_split == "
@@ -164,6 +165,7 @@ def _task_volumes(cfg_volumes: Mapping[str, Any] | None, task_id: str) -> dict[s
         "test": test,
         "test_split": test_split,
         "test_offset": int(test_offset) if test_offset is not None else 0,
+        "train_offset": train_offset,
     }
 
 
@@ -201,14 +203,14 @@ def _sampling_settings(data_cfg: Mapping[str, Any], volumes: Mapping[str, Any], 
 
 def _load_pool(task: TaskSpec, size: int, *, split: str, skip: int, adapter: Any,
                data_cfg: Mapping[str, Any], data_seed: int, sampling: str,
-               buffer_size: int | None) -> tuple[list[Any], Any]:
+               buffer_size: int | None, shuffle_key: str | None = None) -> tuple[list[Any], Any]:
     """One provider load, with HF's own failures surfaced rather than masked as 'blocked'."""
     try:
         return huggingface_pool(
             task, size, split=split, row_adapter=adapter, data_seed=data_seed,
             sampling=sampling, shuffle_buffer_size=buffer_size,
             offline_snapshots=bool(data_cfg.get("offline_snapshots", False)),
-            cache_dir=data_cfg.get("cache_dir"), skip=skip,
+            cache_dir=data_cfg.get("cache_dir"), skip=skip, shuffle_key=shuffle_key,
         )
     except ValueError as exc:                     # datasets raises ValueError for an unknown split
         raise DataError(
@@ -250,7 +252,19 @@ def prepare_data(cfg: ResolvedConfig, *, task_ids: Sequence[str] | None = None) 
     split_caps = data_cfg.get("split_caps") or {}
     # Per-task cap overrides, for corpora that cannot supply the global caps (FinQA).
     task_caps_cfg = data_cfg.get("task_split_caps") or {}
+    # Exact TRAIN / VALIDATION / SUPPORT counts for corpora with no slack (FinQA in l4_full_study).
+    task_counts_cfg = data_cfg.get("task_split_counts") or {}
+    # Content hashes of each task's pool and TEST rows, so a duplicate task can exclude them.
+    loaded_contents: dict[str, set[str]] = {}
+    duplicates: dict[str, str] = {}
     for task in tasks:
+        original = task.duplicate_of
+        if original is not None:
+            if original not in loaded_contents:
+                raise ConfigError(
+                    f"task '{task.task_id}' is a duplicate of '{original}', which must be loaded "
+                    f"earlier in datasets.order (its rows are excluded from the duplicate's pool)")
+            duplicates[task.task_id] = original
         provenance: dict[str, Any] = {
             "provider": provider, "hf_id": task.hf_id, "hf_revision": task.hf_revision,
         }
@@ -261,9 +275,14 @@ def prepare_data(cfg: ResolvedConfig, *, task_ids: Sequence[str] | None = None) 
             if task.task_id in task_ratios_cfg else ratios
         )
         if provider == "synthetic":
-            pool = synthetic_pool(task, int(data_cfg["synthetic_pool_size"]), seed=data_seed)
+            pool_size = int(data_cfg["synthetic_pool_size"])
+            # A duplicate reads its original's stream: training rows after the original's pool,
+            # TEST rows identical.
+            pool = synthetic_pool(task, pool_size, seed=data_seed, stream_key=original,
+                                  offset=pool_size if original else 0)
             test = synthetic_pool(
-                task, int(data_cfg["synthetic_test_size"]), seed=data_seed, offset=1_000_000
+                task, int(data_cfg["synthetic_test_size"]), seed=data_seed, offset=1_000_000,
+                stream_key=original,
             )
         elif provider == "huggingface":
             # Only these two conditions are skippable, and both are checked before any network
@@ -282,9 +301,14 @@ def prepare_data(cfg: ResolvedConfig, *, task_ids: Sequence[str] | None = None) 
 
             volumes = _task_volumes(data_cfg.get("volumes"), task.task_id)
             sampling, buffer_size = _sampling_settings(data_cfg, volumes, task.task_id)
+            if original is not None and volumes["train_offset"] <= 0:
+                raise ConfigError(
+                    f"data.volumes.{task.task_id}.train_offset must skip past '{original}''s pool "
+                    f"(the duplicate's rows come from outside it)")
             pool, pool_report = _load_pool(
-                task, volumes["train_pool"], split=_TRAINING_POOL_SPLIT, skip=0, adapter=adapter,
-                data_cfg=data_cfg, data_seed=data_seed, sampling=sampling, buffer_size=buffer_size,
+                task, volumes["train_pool"], split=_TRAINING_POOL_SPLIT, skip=volumes["train_offset"],
+                adapter=adapter, data_cfg=data_cfg, data_seed=data_seed, sampling=sampling,
+                buffer_size=buffer_size, shuffle_key=original,
             )
             if (volumes["test_split"] == _TRAINING_POOL_SPLIT
                     and volumes["test_offset"] < pool_report.rows_consumed):
@@ -302,7 +326,7 @@ def prepare_data(cfg: ResolvedConfig, *, task_ids: Sequence[str] | None = None) 
                 task, volumes["test"], split=volumes["test_split"],
                 skip=volumes["test_offset"] if volumes["test_split"] == _TRAINING_POOL_SPLIT else 0,
                 adapter=adapter, data_cfg=data_cfg, data_seed=data_seed, sampling=sampling,
-                buffer_size=buffer_size,
+                buffer_size=buffer_size, shuffle_key=original,
             )
             load_reports[task.task_id] = [pool_report, test_report]
             provenance.update({
@@ -318,9 +342,26 @@ def prepare_data(cfg: ResolvedConfig, *, task_ids: Sequence[str] | None = None) 
         else:
             raise PreconditionError(f"unknown data.provider '{provider}'")
 
+        loaded_contents[task.task_id] = {e.content_hash for e in pool} | {e.content_hash for e in test}
+        if original is not None:
+            # Rows of the original's pool or TEST (IMDb repeats some reviews across its upstream
+            # splits) never enter the duplicate's pool; the duplicate's TEST is the original's.
+            excluded = loaded_contents[original]
+            before = len(pool)
+            pool = [e for e in pool if e.content_hash not in excluded]
+            provenance.update({"duplicate_of": original,
+                               "excluded_rows_shared_with_original": before - len(pool)})
+        # D-025: some corpora repeat rows across their upstream splits (DailyDialog: 9 dialogues
+        # in both train and validation), so a TRAIN-pool row can equal a TEST row.  It leaves the
+        # pool; TEST is never changed.  The partition is per row, so every other row keeps its split.
+        test_contents = {e.content_hash for e in test}
+        before = len(pool)
+        pool = [e for e in pool if e.content_hash not in test_contents]
+        provenance["excluded_pool_rows_in_test"] = before - len(pool)
+
         task_splits = build_splits(
             task.task_id, training_pool=pool, test_pool=test, seed=data_seed, ratios=task_ratios,
-            provenance=provenance,
+            provenance=provenance, exact_counts=task_counts_cfg.get(task.task_id),
         )
         caps = {**split_caps, **(task_caps_cfg.get(task.task_id) or {})}
         if caps:
@@ -335,6 +376,7 @@ def prepare_data(cfg: ResolvedConfig, *, task_ids: Sequence[str] | None = None) 
             # idea.md S0.2.1: one config key, applied uniformly to all four splits.
             task_splits = task_splits.subsample(int(cap), seed=data_seed)
             task_splits.assert_disjoint()
+        task_splits.provenance["split_digests"] = task_splits.digests()
         splits[task.task_id] = task_splits
         log.info("task %-10s splits %s", task.task_id, task_splits.counts())
 
@@ -346,10 +388,13 @@ def prepare_data(cfg: ResolvedConfig, *, task_ids: Sequence[str] | None = None) 
         )
 
     report = audit(splits)
+    leakage = report.as_dict()
+    if duplicates or bool(data_cfg.get("content_audit", False)):
+        leakage["content"] = content_audit(splits, duplicate_groups=duplicates).as_dict()
     return PreparedData(
         tasks=[task for task in tasks if task.task_id in splits],
         splits=splits,
-        leakage_report=report.as_dict(),
+        leakage_report=leakage,
         unpinned=[t for t, code in blocked.items() if code == "unpinned_dataset"],
         blocked=blocked,
         load_reports=load_reports,

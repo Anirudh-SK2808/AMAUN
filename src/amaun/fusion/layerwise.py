@@ -146,7 +146,11 @@ def build_fused_model(
     # against the pairwise case so a config that contradicts idea.md is rejected rather than
     # silently reinterpreted.
     equal_contribution = 1.0 / len(components)
-    if len(components) == 2 and abs(cfg.init_value - 0.5) > 1e-9:
+    if not parameterisation.normalised:
+        # ``free`` (l4_full_study): each coefficient starts at the configured value (1.0 = every
+        # component at full strength); the equal-contribution rule applies to normalised forms.
+        equal_contribution = cfg.init_value
+    elif len(components) == 2 and abs(cfg.init_value - 0.5) > 1e-9:
         raise FusionError(
             f"fusion.coefficient.init_value must be 0.5 for pairwise fusion (idea.md S6.1 fixes "
             f"equal-contribution initialisation and states it is not tunable); got {cfg.init_value}"
@@ -157,7 +161,8 @@ def build_fused_model(
         # Ablation A8: a single coefficient vector for the whole network.
         device = next(base_model.parameters()).device
         size = 1 if parameterisation is AlphaParameterisation.SIGMOID_PAIR else len(components)
-        global_logit = nn.Parameter(torch.zeros(size, device=device, dtype=torch.float32))
+        start = 0.0 if parameterisation.normalised else float(cfg.init_value)
+        global_logit = nn.Parameter(torch.full((size,), start, device=device, dtype=torch.float32))
     elif cfg.granularity != "layerwise":
         raise FusionError(f"unknown fusion granularity '{cfg.granularity}'")
 

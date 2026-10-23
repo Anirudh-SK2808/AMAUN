@@ -98,6 +98,10 @@ class AdapterDelta:
 
     layers: dict[str, LayerDelta] = field(default_factory=dict)
     adapter_id: str = ""
+    #: How the adapter is *stored* (D-013): ``factors`` (LoRA factors, the default) or ``dense``
+    #: (``fusion.storage: dense_delta`` keeps one ``d_out x d_in`` fp32 matrix per layer).  The
+    #: in-memory form is always exact factors; only the byte accounting differs.
+    storage: str = "factors"
 
     # -- mapping surface ---------------------------------------------------------
     def __len__(self) -> int:
@@ -132,6 +136,8 @@ class AdapterDelta:
         return sum(layer.numel for layer in self.layers.values())
 
     def storage_bytes(self) -> int:
+        if self.storage == "dense":
+            return sum(layer.shape[0] * layer.shape[1] * 4 for layer in self.layers.values())
         return sum(
             layer.A.numel() * layer.A.element_size() + layer.B.numel() * layer.B.element_size()
             for layer in self.layers.values()
@@ -156,13 +162,13 @@ class AdapterDelta:
     def to(self, *args, **kwargs) -> "AdapterDelta":
         return AdapterDelta(
             layers={k: v.to(*args, **kwargs) for k, v in self.layers.items()},
-            adapter_id=self.adapter_id,
+            adapter_id=self.adapter_id, storage=self.storage,
         )
 
     def detach_clone(self) -> "AdapterDelta":
         return AdapterDelta(
             layers={k: v.detach_clone() for k, v in self.layers.items()},
-            adapter_id=self.adapter_id,
+            adapter_id=self.adapter_id, storage=self.storage,
         )
 
     # -- persistence -------------------------------------------------------------
@@ -172,6 +178,7 @@ class AdapterDelta:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "adapter_id": self.adapter_id,
+            "storage": self.storage,
             "layer_keys": self.keys(),
             "scalings": {k: v.scaling for k, v in self.items()},
             "tensors": {f"{k}::{name}": getattr(v, name) for k, v in self.items() for name in ("A", "B")},
@@ -189,7 +196,8 @@ class AdapterDelta:
                 B=payload["tensors"][f"{key}::B"],
                 scaling=float(payload["scalings"][key]),
             )
-        return cls(layers=layers, adapter_id=payload.get("adapter_id", ""))
+        return cls(layers=layers, adapter_id=payload.get("adapter_id", ""),
+                   storage=payload.get("storage", "factors"))
 
     # -- structural checks -------------------------------------------------------
     def assert_alignable(self, other: "AdapterDelta") -> list[str]:

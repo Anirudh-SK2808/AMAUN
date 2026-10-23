@@ -56,6 +56,20 @@ class Example:
         digest.update(self.target.encode())
         return digest.hexdigest()
 
+    @property
+    def content_hash(self) -> str:
+        """Hash of the rendered prompt and target only -- no task id.
+
+        ``example_id`` includes the task id, so two tasks built from the same rows (``qa`` and its
+        duplicate ``qa-B``) never collide on it.  Cross-task leakage and row-sharing checks use
+        this hash instead (l4_full_study item 23).
+        """
+        digest = hashlib.sha256()
+        digest.update(self.prompt.encode())
+        digest.update(b"\x00")
+        digest.update(self.target.encode())
+        return digest.hexdigest()
+
 
 @dataclass(frozen=True)
 class SplitRatios:
@@ -124,6 +138,19 @@ class TaskSplits:
 
     def hashes(self, name: SplitName) -> set[str]:
         return {example.example_id for example in self.splits[SplitName(name)]}
+
+    def content_hashes(self, name: SplitName) -> set[str]:
+        return {example.content_hash for example in self.splits[SplitName(name)]}
+
+    def digests(self) -> dict[str, str]:
+        """One sha256 per split over its sorted content hashes: equal digests <=> equal row sets."""
+        out = {}
+        for name, examples in self.splits.items():
+            digest = hashlib.sha256()
+            for item in sorted(example.content_hash for example in examples):
+                digest.update(item.encode())
+            out[name.value] = digest.hexdigest()
+        return out
 
     def assert_disjoint(self) -> None:
         """Invariant I2.1: verify pairwise disjointness by content hash, not by construction.
@@ -202,11 +229,33 @@ def build_splits(
     seed: int,
     ratios: SplitRatios,
     provenance: dict[str, Any] | None = None,
+    exact_counts: Mapping[str, int] | None = None,
 ) -> TaskSplits:
-    """Partition a training pool three ways and attach a separately-sourced test pool."""
+    """Partition a training pool three ways and attach a separately-sourced test pool.
+
+    ``exact_counts`` (``data.task_split_counts``) replaces the ratio assignment for a corpus with
+    no slack (FinQA: 5 700 + 250 + 250 of 6 203 usable rows): the pool is ordered by the same
+    content-keyed bucket hash and cut into consecutive TRAIN / VALIDATION / SUPPORT blocks, so the
+    assignment is still a pure function of content.  Too few rows raises.
+    """
     splits: dict[SplitName, list[Example]] = {name: [] for name in SplitName}
-    for example in training_pool:
-        splits[assign_split(example, seed=seed, ratios=ratios)].append(example)
+    if exact_counts:
+        wanted = [(SplitName(name), int(exact_counts[name])) for name in ("train", "validation", "support")]
+        total = sum(count for _, count in wanted)
+        # Identical rows share a bucket, so ratio assignment keeps them together; consecutive cuts
+        # could split them across a boundary, so exact mode keeps one copy of each.
+        training_pool = list({e.example_id: e for e in training_pool}.values())
+        if len(training_pool) < total:
+            raise DataError(f"task '{task_id}': exact split counts need {total} rows, the pool has "
+                            f"{len(training_pool)}")
+        ordered = sorted(training_pool, key=lambda e: (_bucket(e.task_id, e.example_id, seed), e.example_id))
+        start = 0
+        for name, count in wanted:
+            splits[name] = ordered[start : start + count]
+            start += count
+    else:
+        for example in training_pool:
+            splits[assign_split(example, seed=seed, ratios=ratios)].append(example)
     splits[SplitName.TEST] = list(test_pool)
 
     result = TaskSplits(
@@ -217,7 +266,9 @@ def build_splits(
         provenance={
             "training_pool_size": len(training_pool),
             "test_pool_size": len(test_pool),
-            "split_method": "sha256(task_id|content_hash|seed) mod 10000",
+            "split_method": ("exact counts over sha256(task_id|content_hash|seed) order"
+                             if exact_counts else "sha256(task_id|content_hash|seed) mod 10000"),
+            **({"exact_counts": dict(exact_counts)} if exact_counts else {}),
             **(provenance or {}),
         },
     )

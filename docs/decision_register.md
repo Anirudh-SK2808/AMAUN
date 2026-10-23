@@ -460,6 +460,12 @@ stores the components plus `α`, which is exact but grows linearly in `m`.
 **Recommendation:** `refactorize_svd` at `rank = r` for the reported runs (keeps adapter
 size constant, making the storage claim honest), with the error reported.
 
+**l4_full_study (2026-10-23):** run 1 measured the truncation error at 0.36–0.48 mean, 0.58 max
+per layer, so this run fuses with `keep_components` (exact, stored bytes recorded as they are)
+and logs the error `refactorize_svd` *would* have had. F-0 keeps `refactorize_svd` as the
+run-1 reference. The storage claim is therefore measured, not assumed, and is worse than
+`refactorize_svd` would suggest.
+
 ---
 
 ## D-014 — Adapter-count accounting under fusion
@@ -473,6 +479,236 @@ fusion look free. The honest accounting must report, per task index: adapter cou
 count reduction bought by performance loss is visible.
 
 **Recommendation:** all four reported jointly; adapter count never reported alone.
+
+---
+
+## D-017 — Installed fused adapters ran at `alpha/r` times their value (finding)
+
+**Status:** `RESOLVED` 2026-10-23 (code defect; fixed, not a methodology choice)
+
+`fuse_to_delta` folds every scaling into `B` and returns `LayerDelta(scaling=1.0)`, so the
+fused update is `B·A`. `load_delta_into` copied `A` and `B` into the PEFT LoRA layer without
+looking at `delta.scaling`, and PEFT multiplies by its own `lora_alpha / r = 2.0`. Every fused
+adapter in run 1 (`results/local_smoke/l4_decision_study/`) was therefore **evaluated, loss-measured
+and probed at twice its intended update**: with α ≈ 0.5 / 0.5 the installed update was close to
+`ΔW_old + ΔW_new`, not their average. Trained adapters were unaffected (their scaling equals the
+layer's). Run 1's fusion numbers must be read with this in mind; the run-1 code path is not
+re-run except as F-0, which uses the corrected installer.
+
+**Fix:** `load_delta_into` installs `B · (delta.scaling / layer.scaling)`, so the installed update
+is exactly `delta.scaling · B · A`. It also installs factors of any rank (needed by
+`keep_components`, D-013), and `reset_lora_parameters` restores the spec rank before training.
+Tested in `tests/test_full_study_fusion.py`.
+
+---
+
+## D-018 — Acceptability, oracle, decision quality, and the adapter cap (l4_full_study)
+
+**Status:** `PROVISIONAL` (the definitions are fixed by `docs/l4_next_run_prompt.md` items 5–7;
+the cap fallback below is an agent choice the prompt does not make)
+
+- **Acceptable:** new ≥ 0.98 × CREATE and every old task's relative drop ≤ 1 %, on point
+  estimates. **Inconclusive:** the paired bootstrap 95 % CI of (option − 0.98 × CREATE) contains 0.
+- **Oracle:** cheapest acceptable option — fewest adapters after, then least training seconds, then
+  higher new-task score; CREATE if none is acceptable.
+- **Per policy:** `decision_correct`, `quality_shortfall = max(0, 0.98·CREATE − chosen)`,
+  `cost_excess` (adapters, seconds vs the oracle), `forgetting` (max relative old drop). Run 1's
+  `average_performance`, `oracle_option` and `regret_vs_oracle` remain as secondary fields.
+- **Cap (`max_adapters`):** at the cap CREATE is infeasible. *Choice made here:* every policy's
+  CREATE becomes **BACKBONE** ("no room: serve the task with the frozen backbone"), the same rule
+  for every policy so the comparison stays fair. The capped oracle is the cheapest acceptable
+  *feasible* option; if none, the feasible option with the highest new-task score among those with
+  ≤ 1 % forgetting (BACKBONE always qualifies). *Alternative not taken:* a policy-specific fallback
+  (e.g. `amaun` → FUSE with its best-U candidate), which would mix the decision rule with the cap
+  rule. Switch by changing `study_criteria.cap_fallback`.
+
+---
+
+## D-019 — Measured labels and the utility network's supervision (l4_full_study)
+
+**Status:** `PROVISIONAL` (prompt items 9, 12–14)
+
+- Labels use the measured task metric on VALIDATION: 150 generations for qa / qa-B / sentiment,
+  100 for sum / instr / dialog (`decision_study.label_examples`). `beneficial` =
+  fused/standalone ≥ 0.98 and max relative old drop ≤ 1 %. The loss-proxy label is kept as
+  `beneficial_loss_proxy` and agreement is reported.
+- Head targets: `primary_score` = fused / standalone new-task metric; `forgetting` = max relative
+  old drop; `memory` = `communication` = stored MB; `confidence` and `long_term_loss` keep run 1's
+  loss-based definitions (measured, not proxied, but not task metrics — the prompt names only the
+  first four). Every head is z-scored on the fit split.
+- Leave-one-new-task-out CV (6 folds); τ_u from out-of-fold utilities; refit on all pairs.
+- Fit only with ≥ 20 pairs and 20–80 % beneficial; otherwise `amaun` and `amaun_train_first` use
+  `probe_rule` and the reason is written to `utility_supervision.json`.
+- Reuse-gate target: relative measured gap `s(A_cand)/s(A_dedicated) − 1`, tolerance 0.02.
+
+---
+
+## D-020 — The `amaun` decision order, BACKBONE, and the simple policies (l4_full_study)
+
+**Status:** `PROVISIONAL` (prompt items 8, 15–17)
+
+`amaun`: (1) the reuse gate fires → REUSE; else backbone probe score ≥ 0.98 × best candidate's →
+BACKBONE; (2) max U ≥ τ_u → FUSE with the best-U candidate; (3) CREATE.
+`amaun_train_first` (*interpretation made here*): the same order, where step (1)'s REUSE comes
+from the post-training evidence instead of the pre-training gate — U ≥ τ_reuse and the support
+pre-screen (candidate support loss ≤ A_temp's) — and step (1)'s BACKBONE check is unchanged.
+Probes are 16 SUPPORT examples: teacher-forced loss and greedy-generation primary metric.
+`probe_rule`, REUSE-only (best probe score), FUSE-only (best probe loss gain), `always_merge`
+(nearest `semantic.d_task_sq`) and `fixed_rule` (run-1 B4) as in the prompt.
+
+---
+
+## D-021 — Tasks added for l4_full_study
+
+**Status:** `PROVISIONAL` (prompt items 19–25; revisions resolved 2026-10-23 from the Hub API,
+to be re-verified on the VM)
+
+- `xsum`: EdinburghNLP/xsum @ `7d4d486c2f8ef850b1a11aead99b894ff3dd7da9` (parquet on `main`);
+  TEST from upstream `test`. License declared `unknown` on the card (BBC articles; research use).
+- `ner`: eriktks/conll2003, `main` holds only a loading script, so pinned to
+  `refs/convert/parquet` @ `ce85b39f9dd99f552d0739d456814e95fb6a39b0` (the D-006 FR-2.6
+  mechanism), `hf_config: null` (the conversion exposes only `default`; verified on the VM
+  2026-10-23: 14 041 train / 3 453 test rows, tag order as `tag_names`). Row adapter `conll_entities`: sentence = tokens joined by spaces; target = one
+  `TYPE: span` line per entity in order, `none` when the sentence has none; `-DOCSTART-` rows
+  emit nothing. *Metric definition chosen here:* `entity_f1` is exact (type, span) F1 **per
+  sentence, averaged over sentences** (an empty prediction for an empty reference scores 1), so
+  per-example bootstrap CIs are possible; corpus micro F1 is reported as `entity_f1_micro`.
+- `qa-B`, `sentiment-B`: the original's shuffled stream after `train_offset: 9000`, minus every
+  content hash in the original's pool; TEST identical to the original's.
+- FinQA (`domain`): exact-count split **5 656** / 250 / 250 / 300 (ratios cannot fill
+  TRAIN + 250 + 250 from so small a pool). *Revised 2026-10-23 on the VM:* the prompt's 5 700 /
+  250 / 250 needs 6 200 rows, but of FinQA's 6 203 usable rows 47 repeat another row exactly
+  (6 156 distinct), and exact-count mode keeps one copy of each. TRAIN was cut to every distinct
+  row left after VALIDATION and SUPPORT (5 656 = 6 156 − 500); VALIDATION stays 250 (item F13).
+  Training: 353 optimiser steps instead of 356.
+- ELI5 (`longform`): primary metric rescaled BERTScore-F1 — roberta-large @
+  `722cf37b1afa9454edce342e7895e588b6ff1d59`, layer 17, no idf, baseline F = 0.83122575
+  (bert_score 0.3.13 `rescale_baseline/en/roberta-large.tsv`). BERTScore was **not** implemented
+  before this change (the prompt's "already implemented" was incorrect: `task_metrics.py` listed it
+  as unimplemented); `amaun.evaluation.bertscore` re-implements bert_score's greedy matching.
+- Per-task `max_new_tokens` = `max_target_tokens` (the global cap is raised to 512).
+
+---
+
+## D-022 — Evidence that run 1's splits are reproduced
+
+**Status:** `RESOLVED` 2026-10-23 (finding + check)
+
+Run 1's `decision_study/data.json` records snapshot keys and split sizes but **no per-row hashes**,
+so "row hashes match run 1" cannot be checked literally. Preflight therefore checks the strongest
+evidence run 1 recorded: (a) the data config of sum / qa / sentiment equals run 1's
+`config_used.json`; (b) every load's snapshot key equals run 1's; (c) split sizes are equal;
+(d) each seed adapter's TRAIN token count (prompt + target after truncation, the quantity run 1
+logged as `tokens_seen` over exactly one epoch) equals run 1's `initial_adapters.json`. This run
+writes per-split row digests (`split_digests`) into its own `data.json`, so later runs can compare
+rows exactly.
+
+---
+
+## D-023 — Feasibility rules and determinism (l4_full_study)
+
+**Status:** `PROVISIONAL` (prompt items 11, 26)
+
+R1 (standalone scores once), R2 (a stream CREATE reuses the adapter trained for that task — same
+adapter id, hence the same derived seed), R3 (re-evaluate only changed tasks, then all at the end).
+Evaluations are cached by (adapter content hash, task, split, example count), so R1 and R3 are
+equalities by construction; dummy-tier tests compare them with the naive computation.
+`deterministic: true` sets `CUBLAS_WORKSPACE_CONFIG=:4096:8` and strict deterministic algorithms
+before the backbone loads; an op without a deterministic kernel raises in preflight rather than
+silently running nondeterministically.
+
+---
+
+## D-024 — Left out of l4_full_study to fit ~30 h (future work)
+
+**Status:** `OPEN` (deferred by `docs/l4_next_run_prompt.md`)
+
+More seeds (the run has one, 1234; no seed-to-seed variance is measured); ablations A3 (fixed α)
+and A8 (global α) inside the run (both remain selectable: `parameterisation: free` with
+`learning_rate: 0`, `granularity: global`); 300-step fusion; GSM8K; `probe_rule` and the other
+baselines in the sequential stream (they are compared in Phase 5).
+
+---
+
+## D-025 — Training-pool rows that repeat a TEST row of the same task
+
+**Status:** `RESOLVED` 2026-10-23 (user decision, after `--prepare-only` failed on the VM)
+
+Some corpora repeat rows across their upstream splits. DailyDialog has 9 dialogues in both its
+`train` split (dialog's training pool) and its `validation` split (dialog's TEST), so the
+disjointness check (invariant I2.1) stopped `prepare_data`. Decision: for **every** task, a
+training-pool row whose content hash (prompt + target) equals one of the same task's TEST rows is
+dropped from the pool before the split. TEST is never changed. The split is assigned per row from
+its own content, so every other row keeps its split; the TRAIN cap may then take a few different
+rows to fill 6 000. The number dropped is recorded per task as
+`provenance.excluded_pool_rows_in_test`. sum, qa and sentiment had no such rows in run 1 (it
+passed the same check), so their splits are unchanged and D-022's run-1 check still applies.
+Alternative considered: replacing DailyDialog; rejected because other corpora (e.g. CoNLL-2003)
+can repeat short rows across splits too. Test: `tests/test_pool_test_overlap.py`.
+
+---
+
+## D-026 — Merged-weight, batched evaluation (overrides prompt rule 7)
+
+**Status:** `RESOLVED` 2026-10-23 (user decision, after the first L4 preflight projected 78.4 h)
+
+**Why.** The first launch stopped in Phase 0: projected 78.4 h against the 32 h budget (69 h on
+this host's probe costs alone), ~58 h of it greedy generation. Measured on the L4: the backbone
+decodes at 35 ms/token, but with the LoRA branch installed at 78 ms/token (the KV cache is in
+use; the cost is the adapter's extra matmuls on every adapted module at every token), and the
+evaluator generated one example at a time. `docs/l4_next_run_prompt.md` rule 7 ("no speed
+optimisations") is overridden for evaluation only.
+
+**Decision.**
+1. `evaluation.merged_weights: true` — every generating evaluation of the full study (TEST,
+   VALIDATION labels, eligibility, SUPPORT probes, the Phase 7 audit) runs with the adapter merged
+   into the base weights, `W + scaling * B @ A` summed in fp32 and stored in bf16, with the LoRA
+   branch disabled (`amaun.adapters.lora.MergedWeights`). Base weights are restored by copying
+   back a pristine CPU snapshot, never by subtraction, so the backbone is bit-for-bit unchanged
+   (the run's fingerprint check proves it). Loss-only paths (features, validation loss, fusion,
+   training) keep the LoRA branch.
+2. `generation.batch_size: 4` — 4 prompts per `generate` call, left-padded, grouped by prompt
+   length, predictions returned in example order. Default 1 elsewhere (run 1's path).
+
+**Evidence** (L4, run-1 seed adapters, VALIDATION, current path vs merged vs merged + batch):
+
+| Task | Path | Time | Score | Outputs identical to current |
+|---|---|---|---|---|
+| sum (32, ROUGE-L) | current | 130 s | 0.2379 | — |
+| | merged | 64 s | 0.2443 | 17/32 |
+| | merged + batch 4 | 23 s | 0.2370 | 15/32 |
+| | merged + batch 8 | 13 s | 0.2226 | 15/32 |
+| qa (64, token F1) | current | 27 s | 0.8645 | — |
+| | merged / + batch 4 / + batch 8 | 13 / 7 / 5 s | 0.8645 | 64/64 each |
+
+Short outputs are unchanged; long greedy outputs can diverge after one rounding difference, with
+the score moving by about as much as the current path's own rounding sensitivity. Batch 8 moved
+the sum score by −0.015 and was not adopted. Every option of the run is evaluated the same way,
+so within-run comparisons stay like for like; run 1's stored numbers are not comparable at the
+level of individual outputs (F-0 re-runs run 1's setting under this run's evaluation).
+
+**Projection fixes made at the same time** (no measured value changes): generation is timed on
+the evaluator's own path (merged, batch 4, expected decode length = the longest target in a
+batch); run 1's per-example generation costs are not used, as they belong to the old path;
+fusion step cost is `(3 steps − 1 step) / 2`, so first-step set-up is not counted per step; the
+`always_separate` stream runs add no generation (every evaluation is cached from phases 1 and 5);
+old-task TEST of FUSE options is spread over the seed tasks at their own costs instead of all at
+`sum`'s. Phase 3's repeat of Phase 2's pairs is still counted: fusion is not seeded, so its
+result (and the cache key) can differ between repetitions.
+
+**Latent bug fixed on the way.** `_set_rank` (resizing LoRA factors for a rank-2r fused delta)
+created its new parameters as inference tensors when called from `_validation_loss`, which runs
+under `torch.inference_mode`; every later in-place install then failed. Run 1's path never hit it
+because evaluation installed each fused delta first, outside inference mode. The resize now
+always creates normal tensors.
+
+**Memory fix found at the first passing preflight.** Phase 0 loads the BERTScore encoder after
+its memory checks, and the encoder then stayed on the GPU for the whole run: roberta-large in
+fp32 (~1.3 GiB) on top of FinQA's 20.4 GiB fusion peak exceeds the 22.5 GB limit. It is now held
+on CPU and moved to the GPU only inside each ELI5 scoring call (same computation, same values).
+The run was stopped early in Phase 1 and resumed with the fix (`--resume`; config hash unchanged).
+
+Tests: `tests/test_merged_evaluation.py`, `tests/test_bertscore.py`.
 
 ---
 
@@ -496,3 +732,13 @@ count reduction bought by performance loss is visible.
 | D-014 | adapter-count accounting | **OPEN** | efficiency claim |
 | D-015 | row→example adaptation (a `dialog_last_turn`, b `finqa_pre_table_post`/markdown, c `highest_score`) | RESOLVED 2026-09-22 (relayed attribution — see entry) | — |
 | D-016 | sub-corpus sampling (`shuffled_buffer`) | RESOLVED 2026-09-22 (relayed attribution — see entry) | — |
+| D-017 | fused adapters installed at `alpha/r` × their value (run 1) | RESOLVED 2026-10-23 (fixed) | reading run-1 fusion numbers |
+| D-018 | acceptability / oracle / cap fallback | PROVISIONAL | l4_full_study tables |
+| D-019 | measured labels, utility CV, fallback | PROVISIONAL | l4_full_study utility claims |
+| D-020 | `amaun` order, BACKBONE, simple policies | PROVISIONAL | — |
+| D-021 | xsum, ner, duplicates, FinQA counts, BERTScore | PROVISIONAL (verify revisions on VM) | l4_full_study run |
+| D-022 | run-1 split evidence (no row hashes in run 1) | RESOLVED 2026-10-23 | — |
+| D-023 | R1–R3, determinism | PROVISIONAL | — |
+| D-024 | items left out of l4_full_study | **OPEN** (future work) | — |
+| D-025 | training-pool rows repeating a TEST row: dropped from the pool | RESOLVED 2026-10-23 | — |
+| D-026 | merged-weight, batched (4) evaluation; projection fixes | RESOLVED 2026-10-23 | — |

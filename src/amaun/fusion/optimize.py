@@ -65,6 +65,23 @@ class FusionRecord:
 
         return asdict(self)
 
+    def loss_trend(self) -> dict[str, Any]:
+        """Mean ``L_new`` / ``L_KD`` over the first and last 10 % of steps (at least one step each),
+        so a reader sees at a glance whether KD dominated (run 1: L_KD fell 9-37x, L_new rose)."""
+        if not self.loss_trajectory:
+            return {}
+        window = max(1, len(self.loss_trajectory) // 10)
+        first, last = self.loss_trajectory[:window], self.loss_trajectory[-window:]
+
+        def mean(rows: list[dict[str, float]], key: str) -> float:
+            return sum(r[key] for r in rows) / len(rows)
+
+        return {
+            "window_steps": window,
+            **{f"{key}_{edge}": mean(rows, key)
+               for key in ("L_new", "L_KD") for edge, rows in (("first", first), ("last", last))},
+        }
+
     def alpha_summary(self) -> dict[str, float]:
         """Mean coefficient per component across layers -- the interpretability signal of S6.6."""
         if not self.final_alpha_by_layer:
@@ -140,7 +157,9 @@ def run_fusion_kd(
 
     # ---- Step 5 (done first): capture the teacher while the model is still A_old ---------
     teacher: TeacherCache | None = None
-    if kd_cfg.enabled and retention_batches:
+    # lambda = 0 or a training-free fusion (steps = 0, the B3 uniform average) has no KD term, so
+    # no teacher is captured and no retention batch is ever run (l4_full_study item 2).
+    if kd_cfg.enabled and kd_cfg.lam != 0.0 and fusion_cfg.steps > 0 and retention_batches:
         load_delta_into(peft_model, old_adapter)
         teacher = capture_teacher(
             peft_model,
@@ -153,15 +172,16 @@ def run_fusion_kd(
         verify_teacher(teacher, old_adapter.adapter_id)
         record.kd = {**teacher.as_dict(), "lambda": kd_cfg.lam, "enabled": True}
     else:
-        record.kd = {
-            "enabled": False,
-            "reason": (
-                "kd.enabled=false (ablation A4)"
-                if not kd_cfg.enabled
-                else "no retention data available for D_rep"
-            ),
-            "lambda": kd_cfg.lam if kd_cfg.enabled else 0.0,
-        }
+        if not kd_cfg.enabled:
+            reason = "kd.enabled=false (ablation A4)"
+        elif kd_cfg.lam == 0.0:
+            reason = "kd.lambda=0: no KD term"
+        elif fusion_cfg.steps <= 0:
+            reason = "no optimisation steps (training-free fusion)"
+        else:
+            reason = "no retention data available for D_rep"
+        record.kd = {"enabled": False, "reason": reason,
+                     "lambda": kd_cfg.lam if kd_cfg.enabled else 0.0}
 
     # ---- Steps 1-4: build the fused model -----------------------------------------------
     base_model = backbone.model

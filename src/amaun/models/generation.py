@@ -19,6 +19,9 @@ class GenerationConfig:
     temperature: float
     top_p: float
     repetition_penalty: float
+    #: Prompts generated together (left-padded).  1 = one example at a time, as in run 1; >1 is
+    #: the l4_full_study's batched evaluation (D-026), which can shift long outputs by rounding.
+    batch_size: int = 1
 
     @classmethod
     def from_config(cls, section: Mapping[str, Any]) -> "GenerationConfig":
@@ -33,6 +36,7 @@ class GenerationConfig:
             temperature=float(section["temperature"]),
             top_p=float(section["top_p"]),
             repetition_penalty=float(section["repetition_penalty"]),
+            batch_size=int(section.get("batch_size", 1)),
         )
 
     def to_kwargs(self, *, pad_token_id: int | None, eos_token_id: int | None) -> dict[str, Any]:

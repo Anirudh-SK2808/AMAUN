@@ -22,6 +22,11 @@ Two parameterisations are supported, and they agree exactly at ``m = 2``:
 Both satisfy idea.md S6.1's mandated initialisation ``alpha_l = 0.5`` when ``m = 2``
 (invariant I8.1) and keep ``alpha`` bounded in ``(0,1)`` and normalised at every step (I8.2).
 
+A third, ``free``, is the l4_full_study deviation (docs/l4_next_run_prompt.md item 3): one
+independent, unnormalised coefficient per component, initialised to ``init_value`` (1.0), so a
+fused pair can keep both adapters at full strength.  Normalisation forces each component to about
+half strength, which run 1 identified as one reason fusion lost to either source adapter.
+
 One numerical caveat, verified by ``tests/test_fusion_math.py``: at extreme logits (|a| beyond
 roughly 40 in float32) softmax **saturates** to exactly 1.0 and 0.0, so the realised bound is
 ``[0,1]`` rather than the open interval.  Normalisation -- the property fusion actually depends
@@ -45,6 +50,11 @@ from amaun.errors import FusionError
 class AlphaParameterisation(str, enum.Enum):
     SOFTMAX_K = "softmax_k"
     SIGMOID_PAIR = "sigmoid_pair"
+    FREE = "free"
+
+    @property
+    def normalised(self) -> bool:
+        return self is not AlphaParameterisation.FREE
 
 
 class FusedLoRALinear(nn.Module):
@@ -79,7 +89,7 @@ class FusedLoRALinear(nn.Module):
                 f"sigmoid_pair is defined for exactly 2 components (idea.md S6.2), got "
                 f"{self.num_components}; use softmax_k for top-k fusion"
             )
-        if abs(init_value - 1.0 / self.num_components) > 1e-9:
+        if self.parameterisation.normalised and abs(init_value - 1.0 / self.num_components) > 1e-9:
             raise FusionError(
                 f"init_value={init_value} is inconsistent with equal initial contribution for "
                 f"m={self.num_components} components (expected {1.0/self.num_components}). "
@@ -110,12 +120,17 @@ class FusedLoRALinear(nn.Module):
             self._owns_logit = False
         else:
             size = 1 if self.parameterisation is AlphaParameterisation.SIGMOID_PAIR else self.num_components
-            self.fusion_logit = nn.Parameter(torch.zeros(size, device=device, dtype=dtype))
+            # Normalised forms start from zero logits (alpha = 1/m); ``free`` holds the
+            # coefficients themselves, starting at ``init_value``.
+            start = 0.0 if self.parameterisation.normalised else float(init_value)
+            self.fusion_logit = nn.Parameter(torch.full((size,), start, device=device, dtype=dtype))
             self._owns_logit = True
 
     # -- coefficients ------------------------------------------------------------
     def alpha(self) -> torch.Tensor:
-        """Current coefficients, shape ``[m]``, summing to 1 and bounded in (0,1)."""
+        """Current coefficients, shape ``[m]``: normalised for softmax / sigmoid, raw for ``free``."""
+        if self.parameterisation is AlphaParameterisation.FREE:
+            return self.fusion_logit
         if self.parameterisation is AlphaParameterisation.SIGMOID_PAIR:
             first = torch.sigmoid(self.fusion_logit[0])
             return torch.stack([first, 1.0 - first])

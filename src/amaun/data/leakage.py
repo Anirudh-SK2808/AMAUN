@@ -69,3 +69,55 @@ def audit(splits_by_task: Mapping[str, TaskSplits], *, raise_on_critical: bool =
             + "; ".join(report.critical)
         )
     return report
+
+
+# --------------------------------------------------------------------------------------
+# Content-level audit across tasks (l4_full_study item 23)
+# --------------------------------------------------------------------------------------
+
+_POOL_SPLITS = (SplitName.TRAIN, SplitName.VALIDATION, SplitName.SUPPORT)
+
+
+def content_audit(
+    splits_by_task: Mapping[str, TaskSplits],
+    *,
+    duplicate_groups: Mapping[str, str] | None = None,
+    raise_on_critical: bool = True,
+) -> LeakageReport:
+    """Audit every task pair by *content* hash (prompt + target, no task id).
+
+    :func:`audit` compares ``example_id``, which includes the task id, so it cannot see a row
+    shared by two tasks built from the same corpus.  Critical here:
+
+    - any TRAIN row of one task in another task's VALIDATION, SUPPORT or TEST;
+    - for a declared duplicate (``duplicate_groups[dup] = original``), any row shared between the
+      two training pools (TRAIN / VALIDATION / SUPPORT): the duplicate must come from rows outside
+      the original's pool.
+
+    TEST <-> TEST overlap between a duplicate and its original is expected (same TEST set) and is
+    reported, not flagged.
+    """
+    duplicates = dict(duplicate_groups or {})
+    report = LeakageReport()
+    hashes = {(task, name): splits.content_hashes(name)
+              for task, splits in splits_by_task.items() for name in SplitName}
+    tasks = sorted(splits_by_task)
+    for i, left in enumerate(tasks):
+        for right in tasks[i + 1:]:
+            related = duplicates.get(left) == right or duplicates.get(right) == left
+            for a in SplitName:
+                for b in SplitName:
+                    report.pairs_checked += 1
+                    overlap = hashes[(left, a)] & hashes[(right, b)]
+                    if not overlap:
+                        continue
+                    label = f"{left}:{a.value} <-> {right}:{b.value} (content)"
+                    report.overlaps[label] = len(overlap)
+                    train_into_other = ((a is SplitName.TRAIN and b is not SplitName.TRAIN)
+                                        or (b is SplitName.TRAIN and a is not SplitName.TRAIN))
+                    pools_shared = related and a in _POOL_SPLITS and b in _POOL_SPLITS
+                    if train_into_other or pools_shared:
+                        report.critical.append(label)
+    if report.critical and raise_on_critical:
+        raise LeakageError("content shared across tasks where it must not be: " + "; ".join(report.critical))
+    return report

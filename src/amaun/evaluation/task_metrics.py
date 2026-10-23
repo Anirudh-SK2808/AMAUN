@@ -11,9 +11,13 @@ tokens with lowercasing.  It is **not** bit-identical to the ``rouge_score`` pac
 published numbers -- only across arms within this project.  That limitation is stated in
 ``docs/experiment_protocol.md`` rather than left for a reader to discover.
 
-BERTScore is intentionally *not* implemented: it requires a second pretrained model whose
-choice would need holding constant across arms and reporting. The registry raises a clear
-error rather than silently substituting a different metric.
+BERTScore needs a second pretrained model whose identity must be held constant and reported, so
+it is computed only when a run configures one (``evaluation.bertscore``,
+``amaun.evaluation.bertscore``) and passes the scorer in; without one it is reported as
+``bertscore_f1__unavailable`` rather than silently substituted.
+
+``entity_f1`` (l4_full_study NER, D-021) scores ``TYPE: span`` lines by exact (type, span) match,
+per sentence, averaged over sentences; ``entity_f1_micro`` is the corpus-level micro F1.
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from amaun.errors import EvaluationError
 
@@ -101,6 +105,50 @@ def rouge_l(prediction: str, reference: str) -> float:
     return _f_measure(_lcs_length(predicted, referenced), len(predicted), len(referenced))
 
 
+# -- named entities ------------------------------------------------------------------
+NO_ENTITIES = "none"
+
+
+def parse_entities(text: str) -> Counter:
+    """``TYPE: span`` lines -> multiset of ``(TYPE, span)``.  ``none`` / blank lines are empty.
+
+    Matching is exact after trimming, upper-casing the type and collapsing internal whitespace in
+    the span; a line without ``:`` is not an entity.
+    """
+    found: Counter = Counter()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.lower() == NO_ENTITIES or ":" not in line:
+            continue
+        kind, _, span = line.partition(":")
+        kind, span = kind.strip().upper(), " ".join(span.split())
+        if kind and span:
+            found[(kind, span)] += 1
+    return found
+
+
+def entity_f1(prediction: str, reference: str) -> float:
+    """Exact (type, span) F1 for one sentence; no entities on both sides scores 1."""
+    predicted, referenced = parse_entities(prediction), parse_entities(reference)
+    if not predicted and not referenced:
+        return 1.0
+    overlap = sum((predicted & referenced).values())
+    return _f_measure(overlap, sum(predicted.values()), sum(referenced.values()))
+
+
+def entity_f1_micro(predictions: Sequence[str], references: Sequence[str]) -> float:
+    """Corpus micro F1 over all (type, span) entities."""
+    overlap = predicted_total = reference_total = 0
+    for prediction, reference in zip(predictions, references):
+        predicted, referenced = parse_entities(prediction), parse_entities(reference)
+        overlap += sum((predicted & referenced).values())
+        predicted_total += sum(predicted.values())
+        reference_total += sum(referenced.values())
+    if predicted_total == 0 and reference_total == 0:
+        return 1.0
+    return _f_measure(overlap, predicted_total, reference_total)
+
+
 # -- generation diversity ------------------------------------------------------------
 def distinct_n(predictions: Iterable[str], n: int) -> float:
     """Corpus-level distinct-n: unique n-grams / total n-grams (dialogue diversity)."""
@@ -131,15 +179,19 @@ PAIRWISE_METRICS: dict[str, PairMetric] = {
     "rouge1": lambda p, r: rouge_n(p, r, 1),
     "rouge2": lambda p, r: rouge_n(p, r, 2),
     "rougeL": rouge_l,
+    "entity_f1": entity_f1,
 }
+
+# Metrics computed by a configured model-based scorer (``scorers`` argument below).
+SCORER_METRICS = ("bertscore_f1",)
 
 # Metrics deliberately not implemented, with the reason.  Requesting one raises rather than
 # silently substituting a different metric.
 UNIMPLEMENTED_METRICS: dict[str, str] = {
     "bertscore_f1": (
         "BERTScore requires a second pretrained scorer model whose identity, layer, and "
-        "rescaling baseline must be held constant across every arm and reported. Add it as an "
-        "explicit experimental variable (configs/) before enabling."
+        "rescaling baseline must be held constant across every arm and reported. Configure "
+        "evaluation.bertscore so the evaluator passes a scorer (amaun.evaluation.bertscore)."
     ),
     "llm_judge": (
         "LLM-as-judge requires a declared judge model, prompt, and calibration protocol, plus "
@@ -165,15 +217,24 @@ def compute_pairwise(metric: str, predictions: Sequence[str], references: Sequen
     return sum(function(p, r) for p, r in zip(predictions, references)) / len(predictions)
 
 
-def compute_all(
+def compute_with_examples(
     metrics: Sequence[str],
     predictions: Sequence[str],
     references: Sequence[str],
     *,
     mean_token_loss: float | None = None,
-) -> dict[str, float]:
-    """Compute a task's declared metric set, skipping unimplemented ones with a note."""
+    scorers: dict[str, Any] | None = None,
+) -> tuple[dict[str, float], dict[str, list[float]]]:
+    """A task's metric set plus every per-example score that has one (pairwise and scorer metrics).
+
+    Corpus-level metrics (perplexity, distinct-2, micro entity F1) have no per-example value.
+    A scorer metric with no configured scorer is reported as ``<metric>__unavailable``.
+    """
+    if len(predictions) != len(references):
+        raise EvaluationError("prediction/reference count mismatch")
     out: dict[str, float] = {}
+    per_example: dict[str, list[float]] = {}
+    scorers = scorers or {}
     for metric in metrics:
         if metric == "perplexity":
             out["perplexity"] = (
@@ -181,8 +242,32 @@ def compute_all(
             )
         elif metric == "distinct_2":
             out["distinct_2"] = distinct_n(predictions, 2)
+        elif metric == "entity_f1_micro":
+            out[metric] = entity_f1_micro(predictions, references)
+        elif metric in SCORER_METRICS and metric in scorers:
+            values = [float(v) for v in scorers[metric].score(predictions, references)]
+            per_example[metric] = values
+            out[metric] = sum(values) / len(values) if values else float("nan")
         elif metric in UNIMPLEMENTED_METRICS:
             out[f"{metric}__unavailable"] = float("nan")
         else:
-            out[metric] = compute_pairwise(metric, predictions, references)
-    return out
+            if metric not in PAIRWISE_METRICS:
+                compute_pairwise(metric, predictions, references)   # raises the standard error
+            function = PAIRWISE_METRICS[metric]
+            values = [function(p, r) for p, r in zip(predictions, references)]
+            per_example[metric] = values
+            out[metric] = sum(values) / len(values) if values else float("nan")
+    return out, per_example
+
+
+def compute_all(
+    metrics: Sequence[str],
+    predictions: Sequence[str],
+    references: Sequence[str],
+    *,
+    mean_token_loss: float | None = None,
+    scorers: dict[str, Any] | None = None,
+) -> dict[str, float]:
+    """Compute a task's declared metric set, skipping unimplemented ones with a note."""
+    return compute_with_examples(metrics, predictions, references, mean_token_loss=mean_token_loss,
+                                 scorers=scorers)[0]

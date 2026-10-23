@@ -38,6 +38,10 @@ class RefactorizationReport:
     storage: str
     target_rank: int | None
     per_layer_relative_error: dict[str, float] = field(default_factory=dict)
+    #: The rank-``r`` truncation error ``refactorize_svd`` *would* have had, recorded for every
+    #: storage form so the cost of exact storage is comparable with run 1 (D-013).
+    would_be_svd_relative_error: dict[str, float] = field(default_factory=dict)
+    stored_bytes: int | None = None
 
     @property
     def max_relative_error(self) -> float:
@@ -55,6 +59,12 @@ class RefactorizationReport:
             "max_relative_error": self.max_relative_error,
             "mean_relative_error": self.mean_relative_error,
             "per_layer_relative_error": dict(self.per_layer_relative_error),
+            "would_be_svd_mean_relative_error": (
+                sum(self.would_be_svd_relative_error.values()) / len(self.would_be_svd_relative_error)
+                if self.would_be_svd_relative_error else None),
+            "would_be_svd_max_relative_error": max(self.would_be_svd_relative_error.values(), default=None),
+            "would_be_svd_relative_error": dict(self.would_be_svd_relative_error),
+            "stored_bytes": self.stored_bytes,
         }
 
 
@@ -124,21 +134,30 @@ def fuse_to_delta(
     exact = combine_deltas(list(components), alphas)
     exact.adapter_id = adapter_id or exact.adapter_id
     report = RefactorizationReport(storage=storage.value, target_rank=target_rank)
-
-    if storage in (FusionStorage.KEEP_COMPONENTS, FusionStorage.DENSE_DELTA):
-        # Both are exact; concatenated factors already represent the fused delta exactly,
-        # and dense_delta differs only in the on-disk form, handled by the caller.
-        return exact, report
-
-    if target_rank is None:
+    if target_rank is None and storage is FusionStorage.REFACTORIZE_SVD:
         raise FusionError("refactorize_svd requires a target rank (fusion.refactorize_rank or r)")
 
     layers: dict[str, LayerDelta] = {}
     for key, layer in exact.items():
+        if target_rank is None:
+            break
         if layer.rank < min(layer.shape):
             a, b, error = _svd_factorize_lowrank(layer, target_rank)
         else:
             a, b, error = _svd_factorize(layer.dense(), target_rank)
-        layers[key] = LayerDelta(A=a, B=b, scaling=1.0)
-        report.per_layer_relative_error[key] = error
-    return AdapterDelta(layers=layers, adapter_id=exact.adapter_id), report
+        report.would_be_svd_relative_error[key] = error
+        if storage is FusionStorage.REFACTORIZE_SVD:
+            layers[key] = LayerDelta(A=a, B=b, scaling=1.0)
+            report.per_layer_relative_error[key] = error
+
+    if storage in (FusionStorage.KEEP_COMPONENTS, FusionStorage.DENSE_DELTA):
+        # Both are exact: the concatenated factors represent the fused delta exactly.  They differ
+        # in what is stored -- the components (factors) or one dense matrix per layer.
+        if storage is FusionStorage.DENSE_DELTA:
+            exact.storage = "dense"
+        report.stored_bytes = exact.storage_bytes()
+        return exact, report
+
+    fused = AdapterDelta(layers=layers, adapter_id=exact.adapter_id)
+    report.stored_bytes = fused.storage_bytes()
+    return fused, report

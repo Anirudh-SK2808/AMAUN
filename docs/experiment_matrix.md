@@ -68,6 +68,13 @@ This is the only arm that measures the decision *directly* rather than through d
 score, and it is what makes the core research question answerable rather than merely
 correlated with performance.
 
+## Decision study runs (`local_smoke`, non-reportable)
+
+| id | Description | Config | Question |
+|---|---|---|---|
+| `l4_decision_study` | run 1: 3 seeds, 2 evaluation tasks, 12 h | `configs/experiments/l4_decision_study.yaml` | does the pipeline run end to end on an L4? |
+| `l4_full_study` | one run: 6 seeds, fusion selection on VALIDATION, 30 measured pairs, 5 evaluation tasks with BACKBONE / REUSE / FUSE / CREATE on TEST, 8 policies + oracle, cap 6, 4 sequential streams | `configs/experiments/l4_full_study.yaml` | does fixed fusion work; does the learned utility beat `probe_rule` / `fixed_rule`; does AMAUN beat `always_separate` when CREATE is not free? (D-017 – D-024) |
+
 ## Run order
 
 ```

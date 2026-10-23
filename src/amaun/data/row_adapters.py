@@ -431,6 +431,62 @@ class _LabelToText:
 
 
 # --------------------------------------------------------------------------------------
+# conll_entities -- token/BIO-tag rows (CoNLL-2003) as sentence -> "TYPE: span" lines
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _ConllEntities:
+    """CoNLL-style NER rows: ``tokens`` and integer BIO ``ner_tags`` (D-021).
+
+    Input slot ``sentence`` = tokens joined by single spaces.  Target = one ``TYPE: span`` line per
+    entity in sentence order, or ``row_adapter_options.empty_target`` when there is none.  The tag
+    names (index -> ``B-PER`` ...) are an option with no default, because they are the dataset's
+    ClassLabel order.  Rows whose tokens are exactly ``row_adapter_options.skip_tokens`` (CoNLL's
+    ``-DOCSTART-`` separators) emit nothing.  An ``I-`` tag that does not continue an entity of the
+    same type starts a new one (the conlleval convention).
+    """
+
+    name: str = "conll_entities"
+
+    def required_row_fields(self, spec: TaskSpec, options: Mapping[str, Any]) -> tuple[str, ...]:
+        return ("tokens", "ner_tags")
+
+    def adapt(
+        self, spec: TaskSpec, row: Mapping[str, Any], options: Mapping[str, Any]
+    ) -> list[AdaptedExample]:
+        names = options.get("tag_names")
+        empty = options.get("empty_target")
+        if not names or empty is None:
+            raise UnresolvedRowAdapterError(
+                f"row_adapter '{self.name}' requires row_adapter_options.tag_names (the dataset's "
+                f"ClassLabel names in index order) and empty_target ({_D015})"
+            )
+        tokens = [str(t) for t in _require_field(spec, row, "tokens")]
+        tags = list(_require_field(spec, row, "ner_tags"))
+        if len(tokens) != len(tags):
+            raise DataError(f"task '{spec.task_id}': {len(tokens)} tokens but {len(tags)} tags")
+        if tokens == list(options.get("skip_tokens") or []) or not tokens:
+            return []
+        entities: list[tuple[str, list[str]]] = []
+        open_kind: str | None = None          # type of the entity the previous token belongs to
+        for token, tag in zip(tokens, tags):
+            label = tag if isinstance(tag, str) else str(names[int(tag)])
+            if label == "O":
+                open_kind = None
+                continue
+            prefix, _, kind = label.partition("-")
+            if prefix == "I" and open_kind == kind:
+                entities[-1][1].append(token)
+            else:
+                entities.append((kind, [token]))
+            open_kind = kind
+        fields = {name: " ".join(tokens) for name in spec.input_fields}
+        target = "\n".join(f"{kind}: {' '.join(span)}" for kind, span in entities) or str(empty)
+        return [(fields, target)]
+
+
+# --------------------------------------------------------------------------------------
 # Registry
 # --------------------------------------------------------------------------------------
 
@@ -444,6 +500,7 @@ ROW_ADAPTERS: dict[str, RowAdapter] = {
         _FinqaPreTablePost(),
         _FinqaTextOnly(),
         _LabelToText(),
+        _ConllEntities(),
     )
 }
 

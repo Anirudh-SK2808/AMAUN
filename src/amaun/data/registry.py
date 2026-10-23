@@ -28,6 +28,7 @@ class TaskType(str, enum.Enum):
     LONG_FORM_GENERATION = "long_form_generation"
     DOMAIN_GENERATION = "domain_generation"
     SENTIMENT_CLASSIFICATION = "sentiment_classification"
+    NAMED_ENTITY_RECOGNITION = "named_entity_recognition"
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,9 @@ class TaskSpec:
     # How an over-length prompt is cut (amaun.data.preprocess.encode_prompt).  "head" is the
     # original behaviour and stays the default so no existing arm changes.
     prompt_truncation: str = "head"
+    # A duplicate task (l4_full_study item 20): same dataset, metrics and TEST rows as the named
+    # original, training pool drawn from rows outside the original's.  None for every other task.
+    duplicate_of: str | None = None
 
     def require_pinned(self) -> None:
         if not self.pinned or self.hf_id is None:
@@ -114,6 +118,7 @@ def task_spec_from_config(task_id: str, section: dict[str, Any]) -> TaskSpec:
         row_adapter_options=dict(section.get("row_adapter_options") or {}),
         row_adapter_reason=str(section.get("row_adapter_reason", "")),
         prompt_truncation=str(section.get("prompt_truncation", "head")),
+        duplicate_of=section.get("duplicate_of"),
     )
 
 
@@ -135,4 +140,17 @@ def load_curriculum(cfg_section: dict[str, Any]) -> list[TaskSpec]:
     unknown = [t for t in order if t not in tasks]
     if unknown:
         raise DataError(f"curriculum order references unknown tasks: {unknown}")
-    return [task_spec_from_config(task_id, tasks[task_id]) for task_id in order]
+    return [task_spec_from_config(task_id, resolve_task_section(tasks, task_id)) for task_id in order]
+
+
+def resolve_task_section(tasks: dict[str, Any], task_id: str) -> dict[str, Any]:
+    """A task's config; a duplicate (``duplicate_of``) inherits every field it does not set from
+    its original, so it has the original's dataset, template, metrics and token limits by
+    construction (l4_full_study item 20)."""
+    section = dict(tasks[task_id])
+    original = section.get("duplicate_of")
+    if original is None:
+        return section
+    if original not in tasks or tasks[original].get("duplicate_of"):
+        raise DataError(f"task '{task_id}' duplicates '{original}', which is not a plain task in the config")
+    return {**tasks[original], **section}
