@@ -28,6 +28,10 @@ _ALLOWED_FIT_SPLITS = {"utility_train", "train", "validation", "support"}
 _FORBIDDEN_FIT_SPLITS = {"test"}
 
 
+#: A feature whose spread on the fit split is at or below this is constant (D-029).
+CONSTANT_STD = 1e-12
+
+
 @dataclass
 class FeatureNormalizer:
     """Standardises feature vectors, with provenance strong enough to audit."""
@@ -40,6 +44,11 @@ class FeatureNormalizer:
     fitted_run_mode: str | None = None
     fitted_n_samples: int = 0
     signature: str | None = None
+    #: D-029: per feature, whether it varied on the fit split.  ``None`` = every feature is used
+    #: (the behaviour before D-029, and of normalisers saved before it).  A feature that never
+    #: varied carries no information, and dividing a later different value by its zero spread
+    #: would blow it up to ~1e8 (e.g. repository size in a growing stream), so it is left out.
+    active: list[bool] | None = None
 
     @property
     def is_fitted(self) -> bool:
@@ -51,6 +60,7 @@ class FeatureNormalizer:
         *,
         split: str,
         run_mode: str,
+        drop_constant: bool = False,
     ) -> "FeatureNormalizer":
         if split in _FORBIDDEN_FIT_SPLITS:
             raise NormalizerLeakageError(
@@ -93,7 +103,20 @@ class FeatureNormalizer:
         self.fitted_run_mode = run_mode
         self.fitted_n_samples = count
         self.signature = vectors[0].signature()
+        self.active = [sigma > CONSTANT_STD for sigma in stds] if drop_constant else None
+        if self.active is not None and not any(self.active):
+            raise NormalizerLeakageError("every feature is constant on the fit split; nothing to learn from")
         return self
+
+    @property
+    def n_active(self) -> int:
+        return len(self.feature_names) if self.active is None else sum(self.active)
+
+    @property
+    def active_names(self) -> list[str]:
+        if self.active is None:
+            return list(self.feature_names)
+        return [name for name, keep in zip(self.feature_names, self.active) if keep]
 
     def transform(self, vector: FeatureVector, *, run_mode: str) -> list[float]:
         if not self.is_fitted:
@@ -111,10 +134,13 @@ class FeatureNormalizer:
                 f"{vector.signature()}. This usually means a feature family was toggled "
                 f"without refitting the normaliser."
             )
-        return [
+        scaled = [
             (value - mu) / (sigma + self.epsilon)
             for value, mu, sigma in zip(vector.values, self.mean, self.std)
         ]
+        if self.active is None:
+            return scaled
+        return [value for value, keep in zip(scaled, self.active) if keep]
 
     # -- persistence -------------------------------------------------------------
     def save(self, path: Path | str) -> Path:
@@ -130,6 +156,7 @@ class FeatureNormalizer:
                     "fitted_on_split": self.fitted_on_split,
                     "fitted_run_mode": self.fitted_run_mode,
                     "fitted_n_samples": self.fitted_n_samples,
+                    "active": self.active,
                     "signature": self.signature,
                 },
                 handle, indent=2,

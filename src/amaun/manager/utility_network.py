@@ -219,8 +219,13 @@ def train_utility_network(
     fit_split: str,
     run_mode: str,
     seed: int = 0,
+    epoch_callback: Any = None,
 ) -> UtilityTrainingRecord:
-    """Fit ``g_omega`` with ``L_U = sum_i ||g_omega(z_i) - y_i||^2`` (idea.md S9)."""
+    """Fit ``g_omega`` with ``L_U = sum_i ||g_omega(z_i) - y_i||^2`` (idea.md S9).
+
+    ``epoch_callback(epoch, model)`` (1-based epoch, after its last step) lets a caller track a
+    held-out loss for early stopping (D-029); it does not change training.
+    """
     if fit_split == "test":
         raise ManagerError(
             "refusing to train the utility network on the test sequence (idea.md S16.6)"
@@ -277,6 +282,10 @@ def train_utility_network(
             epoch_loss += float(loss.detach())
             batches += 1
         record.loss_trajectory.append(epoch_loss / max(1, batches))
+        if epoch_callback is not None:
+            model.eval()
+            epoch_callback(epoch + 1, model)
+            model.train()
     record.epochs = epochs
     record.final_loss = record.loss_trajectory[-1] if record.loss_trajectory else None
 
@@ -288,3 +297,91 @@ def train_utility_network(
                 torch.nn.functional.mse_loss(predicted[:, index], targets[:, index])
             )
     return record
+
+
+class RidgeUtility(nn.Module):
+    """Closed-form ridge on the normalised features, with the network's utility read-out (D-029).
+
+    Predicts the same z-scored outcome heads as :class:`UtilityNetwork` and turns them into a
+    utility the same way: ``tanh`` of each oriented head, summed with the network's initial
+    scalarisation weights (``softplus(0)`` each -- the trained network's weights never move from
+    them, as the L2 loss does not reach the scalarisation).  Exposes the interface
+    :func:`amaun.manager.retrieval.score_candidates` and :mod:`amaun.manager.utility_cv` use.
+    """
+
+    kind = "ridge"
+
+    def __init__(self, input_dim: int, heads: Sequence[str], *, lam: float) -> None:
+        super().__init__()
+        if input_dim <= 0:
+            raise ManagerError("ridge utility input dimension must be positive")
+        self.input_dim = input_dim
+        self.heads = tuple(heads)
+        self.lam = float(lam)
+        self.register_buffer("weight", torch.zeros(input_dim, len(self.heads)))
+        self.register_buffer("bias", torch.zeros(len(self.heads)))
+        self.register_buffer("target_mean", torch.zeros(len(self.heads)))
+        self.register_buffer("target_std", torch.ones(len(self.heads)))
+        self.register_buffer("orientation", torch.tensor([HEAD_ORIENTATION[h] for h in self.heads],
+                                                         dtype=torch.float32))
+        self.register_buffer("scalar", torch.nn.functional.softplus(torch.zeros(len(self.heads))))
+
+    def fit(self, features: torch.Tensor, targets: torch.Tensor) -> "RidgeUtility":
+        """``W = (X'X + lam I)^-1 X'(Y - mean)`` on centred features, in float64."""
+        with torch.no_grad():
+            mean = targets.mean(dim=0)
+            std = targets.std(dim=0, unbiased=False)
+            self.target_mean.copy_(mean)
+            self.target_std.copy_(torch.where(std > 1e-12, std, torch.ones_like(std)))
+            y = self.standardise_targets(targets).double()
+            x = features.double()
+            x_mean = x.mean(dim=0)
+            xc = x - x_mean
+            gram = xc.T @ xc + self.lam * torch.eye(x.shape[1], dtype=torch.float64)
+            weight = torch.linalg.solve(gram, xc.T @ (y - y.mean(dim=0)))
+            self.weight.copy_(weight.float())
+            self.bias.copy_((y.mean(dim=0) - x_mean @ weight).float())
+        return self
+
+    def predict_outcomes(self, z: torch.Tensor) -> torch.Tensor:
+        return z @ self.weight + self.bias
+
+    def predict_outcomes_raw(self, z: torch.Tensor) -> torch.Tensor:
+        return self.predict_outcomes(z) * self.target_std + self.target_mean
+
+    def standardise_targets(self, targets: torch.Tensor) -> torch.Tensor:
+        return (targets - self.target_mean) / self.target_std
+
+    def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        outcomes = self.predict_outcomes(z)
+        return torch.tanh(outcomes * self.orientation) @ self.scalar, outcomes
+
+    def utility(self, z: torch.Tensor) -> torch.Tensor:
+        return self.forward(z)[0]
+
+    def save(self, path: Path | str, *, run_mode: str, feature_names: Sequence[str]) -> Path:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"kind": self.kind, "state_dict": self.state_dict(), "input_dim": self.input_dim,
+                    "heads": list(self.heads), "lam": self.lam, "run_mode": run_mode,
+                    "feature_names": list(feature_names)}, path)
+        return path
+
+    @classmethod
+    def load(cls, path: Path | str, *, expected_run_mode: str) -> tuple["RidgeUtility", list[str]]:
+        payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+        if payload.get("run_mode") != expected_run_mode:
+            raise ManagerError(f"refusing to load a ridge utility fitted under run_mode="
+                               f"'{payload.get('run_mode')}' into a '{expected_run_mode}' run")
+        model = cls(payload["input_dim"], payload["heads"], lam=payload["lam"])
+        model.load_state_dict(payload["state_dict"])
+        return model, list(payload.get("feature_names", []))
+
+
+def load_utility_model(path: Path | str, *, expected_run_mode: str) -> tuple[nn.Module, list[str]]:
+    """Load a saved utility model of either kind (a network saved before D-029 has no ``kind``)."""
+    payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+    loader = RidgeUtility if payload.get("kind") == RidgeUtility.kind else UtilityNetwork
+    model, names = loader.load(path, expected_run_mode=expected_run_mode)
+    model.eval()
+    return model, names

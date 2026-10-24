@@ -78,8 +78,8 @@ from amaun.manager.decision import Thresholds
 from amaun.manager.retrieval import score_candidates
 from amaun.manager.reuse_gate import GateExample, ReuseGate, ReuseGateConfig
 from amaun.manager.targets import SupervisionExample, SupervisionSet, measure_outcome_targets
-from amaun.manager.utility_cv import FitGate, fit_with_cv
-from amaun.manager.utility_network import UtilityNetwork
+from amaun.manager.utility_cv import FitGate, fit_revised, fit_with_cv, revised_specs
+from amaun.manager.utility_network import load_utility_model
 from amaun.models.backbone import assert_fingerprint_unchanged
 from amaun.training.kd import KDConfig
 from amaun.training.lora_trainer import TrainingConfig, train_adapter
@@ -89,8 +89,10 @@ from amaun.utils.resources import cleanup, memory_snapshot, stability_report
 
 log = get_logger("continual.full_study")
 
-FULL_POLICIES = ("amaun", "amaun_train_first", "probe_rule", "fixed_rule", "always_separate",
+FULL_POLICIES = ("amaun", "amaun_train_first", "amaun_v0", "probe_rule", "fixed_rule", "always_separate",
                  "always_merge", "reuse_only", "fuse_only")
+#: Policies that decide with a utility model (D-029: ``amaun_v0`` is the first-fit network).
+UTILITY_POLICIES = ("amaun", "amaun_train_first", "amaun_v0")
 PHASES = ("P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7")
 
 
@@ -132,6 +134,7 @@ class FullStudyConfig:
     forgetting: float
     eligibility_threshold: float
     bootstrap_resamples: int
+    utility_models: dict[str, Any] | None = None
 
     @classmethod
     def from_config(cls, cfg: ResolvedConfig, *, lora_learning_rate: float) -> "FullStudyConfig":
@@ -177,10 +180,20 @@ class FullStudyConfig:
             forgetting=float(rules.get("forgetting", criteria.FORGETTING)),
             eligibility_threshold=float(rules.get("eligibility", criteria.ELIGIBILITY)),
             bootstrap_resamples=int(rules.get("bootstrap_resamples", 1000)),
+            utility_models=dict(section["utility_models"]) if section.get("utility_models") else None,
         )
 
     def variant(self, name: str) -> FusionVariant:
         return next(v for v in self.fusion_grid if v.name == name)
+
+
+@dataclass
+class UtilityModel:
+    """A frozen utility model with the normaliser and thresholds it was fitted with."""
+
+    model: Any
+    normalizer: FeatureNormalizer
+    thresholds: Thresholds
 
 
 class _ResumableClock(_Clock):
@@ -218,7 +231,9 @@ class FullStudy(DecisionStudy):
         self._hash_memo: dict[int, tuple[AdapterDelta, str]] = {}
         self.temp: dict[str, dict[str, Any]] = {}            # task -> {"delta", "entry", "record"}
         self.seed_by_task: dict[str, str] = {a.task_id: a.adapter_id for a in self.study.initial_adapters}
-        self.network = self.normalizer = self.thresholds = None
+        #: Frozen utility models by policy family: "amaun" (the D-029 selection, or the first-fit
+        #: network without ``full_study.utility_models``) and "amaun_v0" (the first-fit network).
+        self.models: dict[str, UtilityModel | None] = {"amaun": None, "amaun_v0": None}
         self.reuse_gate = None
         self.selected: FusionVariant | None = None
 
@@ -912,12 +927,16 @@ class FullStudy(DecisionStudy):
         supervision.n_pairs_considered = supervision.n_pairs_evaluated = len(measurements)
 
         cv = fit_with_cv(self.cfg, supervision, gate=self.full.fit_gate)
+        revised = (fit_revised(self.cfg, supervision, gate=self.full.fit_gate,
+                               specs=revised_specs(self.full.utility_models))
+                   if self.full.utility_models else None)
         paths = self.tracker.paths.utility_network
+        # With D-029 the first-fit network lives in v0/ and the selected revision at the top level.
+        v0_dir = paths / "v0" if revised is not None else paths
         if cv.fitted:
-            cv.network.save(paths / "utility_network.pt", run_mode=self.cfg.run_mode.value,
-                            feature_names=list(cv.normalizer.feature_names))
-            cv.normalizer.save(paths / "normalizer.json")
-            (paths / "thresholds.json").write_text(json.dumps(cv.thresholds.as_dict(), indent=2))
+            self._save_model(v0_dir, cv.network, cv.normalizer, cv.thresholds)
+        if revised is not None and revised.fitted:
+            self._save_model(paths, revised.model, revised.normalizer, revised.thresholds)
         gate_cfg = ReuseGateConfig.from_config(self.cfg.section("utility")["reuse_gate"])
         gate = ReuseGate.fit(gate_examples, gate_cfg, run_mode=self.cfg.run_mode.value)
         gate.save(paths / "reuse_gate.json")
@@ -929,7 +948,10 @@ class FullStudy(DecisionStudy):
             "supervision": supervision.as_dict(),
             "label_definition": "measured metric on VALIDATION (D-019); loss proxy kept as beneficial_loss_proxy",
             "utility_network": cv.as_dict(),
-            "amaun_uses": "utility network" if cv.fitted else "probe_rule (automatic fallback)",
+            "revised_utility_models": revised.as_dict() if revised is not None else None,
+            "amaun_uses": ((f"{revised.selected} (D-029 selection)" if revised is not None else "utility network")
+                           if cv.fitted else "probe_rule (automatic fallback)"),
+            "amaun_v0_uses": "first-fit utility network (D-029)" if revised is not None and cv.fitted else None,
             "fallback_reason": None if cv.fitted else cv.reason,
             "reuse_gate": {**gate.as_dict(), "target": "relative measured gap s(A_cand)/s(A_dedicated) - 1",
                            "in_sample": [{"task": e.task_id, "candidate": e.candidate_id, "measured_gap": e.gap,
@@ -937,28 +959,53 @@ class FullStudy(DecisionStudy):
             "fixed_rule_threshold": fixed,
         }
         self._write("utility_supervision.json", report)
-        return {"fitted": cv.fitted, "reason": cv.reason,
-                "thresholds": cv.thresholds.as_dict() if cv.thresholds else None,
-                "oof_decision_accuracy": cv.oof_decision_accuracy, "per_head_oof_mse": cv.per_head_oof_mse,
-                "fixed_rule_threshold": fixed.get("threshold"), "reuse_gate_trained": gate.trained}
+        summary = {"fitted": cv.fitted, "reason": cv.reason,
+                   "thresholds": cv.thresholds.as_dict() if cv.thresholds else None,
+                   "oof_decision_accuracy": cv.oof_decision_accuracy, "per_head_oof_mse": cv.per_head_oof_mse,
+                   "fixed_rule_threshold": fixed.get("threshold"), "reuse_gate_trained": gate.trained}
+        if revised is not None:
+            summary = {"v0": summary, "selected": revised.selected,
+                       "thresholds": revised.thresholds.as_dict() if revised.thresholds else None,
+                       "candidates": {c["name"]: {"oof_decision_accuracy": c["oof_decision_accuracy"],
+                                                  "primary_score_oof_mse": c["per_head_oof_mse"].get("primary_score"),
+                                                  c["hyper_name"]: c["final_hyper"],
+                                                  "n_active_features": c["n_active_features"]}
+                                      for c in revised.as_dict()["candidates"]},
+                       "fitted": revised.fitted, "reason": revised.reason,
+                       "fixed_rule_threshold": fixed.get("threshold"), "reuse_gate_trained": gate.trained}
+        return summary
+
+    def _save_model(self, directory: Path, model: Any, normalizer: FeatureNormalizer, thresholds: Thresholds) -> None:
+        model.save(directory / "utility_network.pt", run_mode=self.cfg.run_mode.value,
+                   feature_names=list(normalizer.feature_names))
+        normalizer.save(directory / "normalizer.json")
+        (directory / "thresholds.json").write_text(json.dumps(thresholds.as_dict(), indent=2))
+
+    def _load_model(self, directory: Path) -> "UtilityModel | None":
+        if not (directory / "utility_network.pt").exists():
+            return None
+        mode = self.cfg.run_mode.value
+        model, _ = load_utility_model(directory / "utility_network.pt", expected_run_mode=mode)
+        return UtilityModel(model, FeatureNormalizer.load(directory / "normalizer.json", expected_run_mode=mode),
+                            Thresholds(**json.loads((directory / "thresholds.json").read_text())))
 
     def _restore_frozen(self) -> None:
         """Reload everything Phase 4 froze (also after a resume)."""
         paths = self.tracker.paths.utility_network
         mode = self.cfg.run_mode.value
-        if (paths / "utility_network.pt").exists():
-            self.network, _ = UtilityNetwork.load(paths / "utility_network.pt", expected_run_mode=mode)
-            self.network.eval()
-            self.normalizer = FeatureNormalizer.load(paths / "normalizer.json", expected_run_mode=mode)
-            self.thresholds = Thresholds(**json.loads((paths / "thresholds.json").read_text()))
-        else:
-            self.network = self.normalizer = self.thresholds = None
+        self.models["amaun"] = self._load_model(paths)
+        self.models["amaun_v0"] = self._load_model(paths / "v0") if self.full.utility_models else self.models["amaun"]
         self.reuse_gate = (ReuseGate.load(paths / "reuse_gate.json", expected_run_mode=mode)
                            if (paths / "reuse_gate.json").exists() else None)
         fixed = paths / "fixed_rule_threshold.json"
         self.fixed_rule_threshold = json.loads(fixed.read_text()) if fixed.exists() else {"threshold": None}
 
     # -- decisions (phases 5 and 6) -------------------------------------------------
+    @staticmethod
+    def _family(policy: str) -> str:
+        """Which frozen utility model a policy decides with."""
+        return "amaun_v0" if policy == "amaun_v0" else "amaun"
+
     def probes(self, task_id: str, candidates: Sequence[AdapterEntry]) -> dict[str, Any]:
         """SUPPORT probes: loss (gate features) and measured score for the backbone and candidates."""
         n = self.full.probe_examples
@@ -985,36 +1032,41 @@ class FullStudy(DecisionStudy):
         probes = self.probes(task_id, candidates)
         backbone, cand = probes["backbone"], probes["candidates"]
         gate = None
-        if self.reuse_gate is not None and any(p in policies for p in ("amaun",)):
+        if self.reuse_gate is not None and any(p in policies for p in ("amaun", "amaun_v0")):
             gate = self.reuse_gate.decide(probes["gate_features"], run_mode=self.cfg.run_mode.value)
         vectors: dict[str, FeatureVector] = {}
-        if any(p in policies for p in ("amaun", "amaun_train_first", "fixed_rule", "always_merge")):
+        if any(p in policies for p in (*UTILITY_POLICIES, "fixed_rule", "always_merge")):
             contexts = self.runner._build_contexts(task_id, task_index, temp_delta, candidates=list(candidates))
             vectors = {cid: self.runner.extractor.extract(ctx) for cid, ctx in contexts.items()}
             del contexts
-        utilities = None
-        if self.network is not None and vectors:
-            scored = score_candidates(network=self.network, normalizer=self.normalizer, vectors=vectors,
-                                      run_mode=self.cfg.run_mode.value)
-            utilities = {s.adapter_id: s.utility for s in scored}
+        utilities: dict[str, dict[str, float] | None] = {}
+        for family in ("amaun", "amaun_v0"):
+            frozen = self.models.get(family)
+            utilities[family] = None
+            if frozen is not None and vectors and any(self._family(p) == family for p in policies
+                                                      if p in UTILITY_POLICIES):
+                scored = score_candidates(network=frozen.model, normalizer=frozen.normalizer, vectors=vectors,
+                                          run_mode=self.cfg.run_mode.value)
+                utilities[family] = {s.adapter_id: s.utility for s in scored}
         margin = float(self.cfg.get("manager.reuse_prescreen_margin", 0.0))
         prescreen = {cid: (v.as_dict().get("performance.L_val_gap") is not None
                            and v.as_dict()["performance.L_val_gap"] <= margin) for cid, v in vectors.items()}
         rule = criteria.probe_rule(backbone, cand, equivalence=self.full.equivalence)
         decisions: dict[str, dict[str, Any]] = {}
         for policy in policies:
-            if policy in ("amaun", "amaun_train_first"):
-                if self.network is None:
+            if policy in UTILITY_POLICIES:
+                frozen, scores = self.models.get(self._family(policy)), utilities[self._family(policy)]
+                if frozen is None:
                     decisions[policy] = {**rule, "fallback": "probe_rule (utility network not fitted)"}
                     continue
-                if policy == "amaun":
+                if policy in ("amaun", "amaun_v0"):
                     reuse = gate.adapter_id if gate is not None and gate.fired else None
                 else:   # D-020: REUSE from the post-training evidence
-                    best = max(utilities, key=lambda c: (utilities[c], c))
-                    reuse = best if utilities[best] >= self.thresholds.tau_reuse and prescreen.get(best) else None
+                    best = max(scores, key=lambda c: (scores[c], c))
+                    reuse = best if scores[best] >= frozen.thresholds.tau_reuse and prescreen.get(best) else None
                 decisions[policy] = criteria.amaun_order(
-                    reuse_choice=reuse, backbone=backbone, candidates=cand, utilities=utilities,
-                    tau_u=self.thresholds.tau_u, equivalence=self.full.equivalence)
+                    reuse_choice=reuse, backbone=backbone, candidates=cand, utilities=scores,
+                    tau_u=frozen.thresholds.tau_u, equivalence=self.full.equivalence)
             elif policy == "probe_rule":
                 decisions[policy] = rule
             elif policy == "always_separate":

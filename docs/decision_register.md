@@ -763,6 +763,52 @@ with the fit gate forced open (Phases 4–6 with a fitted network). The run resu
 
 ---
 
+## D-029 — Revised utility models, decided during the run (first-fit network kept as `amaun_v0`)
+
+**Status:** `RESOLVED` 2026-10-24 (user decision, after Phase 4's first fit and before any Phase 5
+decision)
+
+**Why.** Phase 4's first fit (D-019 settings: `[64, 64]`, 200 epochs, batch 32, all 54 features)
+memorised its 30 pairs: training MSE 0.03 (z units) against an out-of-fold primary-score MSE of
+4.8 (predicting the mean scores 1.0), and out-of-fold it picked the best candidate for 2 of 6
+tasks (chance 1 in 5). 22 of the 54 features are constant on the 30 pairs (the continual,
+historical and repository-cost families have no history yet). Separately, a **defect**: the
+normaliser divides by `std + 1e-8`, so a feature that was constant when fitted becomes ~±1e8 when
+it later differs -- certain in the Phase 6 stream (repository size 1-11, fused adapters with
+twice the parameters, growing `TasksServed`), where `amaun`'s decisions would be noise.
+
+**Decision.** `full_study.utility_models` adds two smaller models fitted on the features that
+vary (`FeatureNormalizer.fit(drop_constant=True)`; inactive features are left out of the input):
+
+- `nn_small`: one hidden layer of 8, batch 4, **at most 20 epochs**; early stopping = the epoch
+  with the lowest held-out loss, chosen by an inner leave-one-task-out loop;
+- `ridge`: closed-form ridge, the same z-scored heads and utility read-out as the network; lambda
+  from {0.1, 1, 10, 100} by the same inner loop.
+
+Both are evaluated by **nested** leave-one-new-task-out CV (an outer fold's held-out task never
+reaches its inner loop). The selected model is fixed by a rule written before either was
+evaluated (`utility_cv.SELECTION_RULE`): higher out-of-fold decision accuracy; tie -> lower
+out-of-fold primary-score MSE; tie -> ridge. It is `amaun` / `amaun_train_first`, drives the
+Phase 6 stream, and takes tau_u from its own out-of-fold utilities. The first-fit network is
+refitted identically (deterministic, same settings) and kept as policy **`amaun_v0`** in Phase 5,
+as the pre-registered reference.
+
+**How the run continues.** The config change alters the config hash, so
+`scripts/checkpoint_surgery_d029.py` overrides the resume guard on the record: it refuses while
+the study runs and unless every changed key is under `full_study.policies` /
+`full_study.utility_models` (nothing phases 0-3 read); backs up the checkpoint; renames phase-4+
+outputs with `.pre_d029`; removes phase 4+ completion and Phase 5's per-task decision units; and
+keeps every measurement (Phase 5 adapters, measured options, evaluation and loss caches). The
+surgery is recorded in the checkpoint's `surgeries`.
+
+**Caveat.** The revised models were chosen after seeing the first fit's out-of-fold results,
+hence `amaun_v0` stays in every Phase 5 table. With 30 noisy pairs from 6 tasks, a large gain is
+not expected; the comparison with `probe_rule` and `fixed_rule` on TEST is the test.
+
+Tests: `tests/test_utility_revision.py`.
+
+---
+
 ## Summary
 
 | ID | Topic | Status | Blocks |
@@ -795,3 +841,4 @@ with the fit gate forced open (Phases 4–6 with a fitted network). The run resu
 | D-026 | merged-weight, batched (4) evaluation; projection fixes | RESOLVED 2026-10-23 | — |
 | D-027 | ELI5 judged by gain retention over zero-shot; sign-safe probes and eligibility | RESOLVED 2026-10-24 | — |
 | D-028 | Phase 4 crash (utility-CV fold split name); run resumed | RESOLVED 2026-10-24 | — |
+| D-029 | revised utility models (small NN / ridge, nested CV, constant features dropped); `amaun_v0` kept | RESOLVED 2026-10-24 | — |

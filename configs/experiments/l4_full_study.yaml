@@ -258,8 +258,17 @@ full_study:
                   sum: 150, xsum: 150, longform: 150, instr: 150, dialog: 150}
   probe_examples: 16
   fuse_top_k: 2
-  policies: [amaun, amaun_train_first, probe_rule, fixed_rule, always_separate, always_merge,
+  policies: [amaun, amaun_train_first, amaun_v0, probe_rule, fixed_rule, always_separate, always_merge,
              reuse_only, fuse_only]
+  # D-029 (added during the run, after Phase 4's first fit): the first-fit network (utility.network /
+  # utility.training: [64, 64], 200 epochs, all features) memorised its 30 pairs, and features that
+  # never varied on them would explode in the Phase 6 stream.  Two smaller models are fitted on the
+  # features that vary and compared by nested leave-one-task-out CV; the winner (rule:
+  # manager/utility_cv.SELECTION_RULE) is `amaun` / `amaun_train_first` and drives Phase 6.  The
+  # first-fit network is kept as policy `amaun_v0` (Phase 5 only).
+  utility_models:
+    nn: {hidden_dims: [8], max_epochs: 20, batch_size: 4}   # early stopping: epochs <= 20, chosen by inner CV
+    ridge: {lambdas: [0.1, 1.0, 10.0, 100.0]}                # lambda chosen by inner CV
   caps: [null, 6]
   utility_fit_gate: {min_pairs: 20, min_beneficial_fraction: 0.2, max_beneficial_fraction: 0.8}
   related_groups: [[sum, xsum, longform], [qa, domain], [instr, dialog, longform]]
