@@ -32,6 +32,13 @@ TOLERANCE = 1e-9
 BACKBONE = "BACKBONE"
 CREATE = "CREATE"
 
+#: D-027: metrics on an interval scale -- no meaningful zero, so "x % of the score" is not defined.
+#: Rescaled BERTScore-F1 subtracts the encoder's baseline and is mostly negative on ELI5 (backbone
+#: mean -0.11 on 16 TRAIN rows), where every ratio rule above would flip direction.  For these
+#: metrics the equivalence bar is a share of CREATE's gain over zero-shot (:func:`equivalence_bar`),
+#: and forgetting is a share of the adapter's gain lost (:func:`gain_drop`).
+INTERVAL_SCALE_METRICS = frozenset({"bertscore_f1"})
+
 
 # --------------------------------------------------------------------------------------
 # Relative scores
@@ -46,6 +53,31 @@ def at_least(value: float, bound: float) -> bool:
 def at_most(value: float, bound: float) -> bool:
     """``value <= bound``, counting a value on the boundary up to float error as meeting it."""
     return value <= bound + TOLERANCE
+
+
+def equivalence_bar(reference: float, *, equivalence: float = EQUIVALENCE,
+                    zero_shot: float | None = None) -> float:
+    """The score an option must reach to count as equal to ``reference`` (D-027).
+
+    Ratio-scale metrics: ``equivalence * reference`` (written ``reference - (1 - eq) * |reference|``,
+    which is the same for every non-negative reference and keeps the margin below a negative one).
+    Interval-scale metrics (``zero_shot`` given): ``zero_shot + eq * (reference - zero_shot)`` --
+    the option keeps ``eq`` of the reference's gain over the backbone, whatever the scale's zero.
+    """
+    if zero_shot is not None:
+        return zero_shot + equivalence * (reference - zero_shot)
+    return reference - (1.0 - equivalence) * abs(reference)
+
+
+def gain_drop(standalone: float, post: float, zero_shot: float) -> float:
+    """Interval-scale forgetting: share of the adapter's gain over zero-shot that was lost (D-027).
+
+    With no gain to lose (``standalone <= zero_shot``) the drop is measured against ``|standalone|``.
+    """
+    gain = standalone - zero_shot
+    if gain > 0:
+        return max(0.0, (standalone - post) / gain)
+    return max(0.0, (standalone - post) / abs(standalone)) if standalone else 0.0
 
 
 def relative_score(post: float, reference: float) -> float:
@@ -124,20 +156,35 @@ class OptionMeasure:
 
 
 def acceptability(option: OptionMeasure, create: OptionMeasure, *, equivalence: float = EQUIVALENCE,
-                  forgetting: float = FORGETTING, resamples: int = 1000, seed: int = 0) -> dict[str, Any]:
-    """Acceptable on point estimates; inconclusive when the CI of (option - 0.98 CREATE) holds 0."""
-    acceptable = (at_least(option.new_score, equivalence * create.new_score)
-                  and at_most(option.forgetting, forgetting))
+                  forgetting: float = FORGETTING, resamples: int = 1000, seed: int = 0,
+                  zero_shot: OptionMeasure | None = None) -> dict[str, Any]:
+    """Acceptable on point estimates; inconclusive when the CI of (option - bar) holds 0.
+
+    ``zero_shot`` (the BACKBONE option) switches to the interval-scale bar of D-027; its per-example
+    scores make the per-example bar ``zs_i + eq * (create_i - zs_i)`` for the paired CI.
+    """
+    zs = None if zero_shot is None else zero_shot.new_score
+    bar = equivalence_bar(create.new_score, equivalence=equivalence, zero_shot=zs)
+    acceptable = at_least(option.new_score, bar) and at_most(option.forgetting, forgetting)
     ci = None
     inconclusive = None
     if option.per_example is not None and create.per_example is not None and option.key != create.key:
-        ci = paired_bootstrap_ci(option.per_example, create.per_example, weight_b=equivalence,
-                                 resamples=resamples, seed=seed)
+        if zero_shot is not None and zero_shot.per_example is not None:
+            bars = [z + equivalence * (c - z) for c, z in zip(create.per_example, zero_shot.per_example)]
+            ci = paired_bootstrap_ci(option.per_example, bars, resamples=resamples, seed=seed)
+        else:
+            ci = paired_bootstrap_ci(option.per_example, create.per_example, weight_b=equivalence,
+                                     resamples=resamples, seed=seed)
         inconclusive = ci["contains_zero"]
-    return {"acceptable": acceptable, "inconclusive": inconclusive,
-            "ci_vs_equivalence_of_create": ci,
-            "new_vs_create_ratio": relative_score(option.new_score, create.new_score),
-            "forgetting": option.forgetting}
+    out = {"acceptable": acceptable, "inconclusive": inconclusive,
+           "ci_vs_equivalence_of_create": ci, "equivalence_bar": bar,
+           "new_vs_create_ratio": relative_score(option.new_score, create.new_score),
+           "forgetting": option.forgetting}
+    if zs is not None:
+        gain = create.new_score - zs
+        out["scale"] = "interval (gain retention, D-027)"
+        out["gain_retained_vs_create"] = (option.new_score - zs) / gain if gain else None
+    return out
 
 
 def feasible(option: OptionMeasure, *, at_cap: bool) -> bool:
@@ -153,7 +200,8 @@ def executed_option(chosen_key: str, *, at_cap: bool, fallback: str = CAP_FALLBA
 
 
 def choose_oracle(options: Mapping[str, OptionMeasure], *, at_cap: bool = False,
-                  equivalence: float = EQUIVALENCE, forgetting: float = FORGETTING) -> dict[str, Any]:
+                  equivalence: float = EQUIVALENCE, forgetting: float = FORGETTING,
+                  zero_shot: float | None = None) -> dict[str, Any]:
     """Cheapest acceptable option: fewest adapters, then least training, then higher score.
 
     Uncapped, CREATE is always acceptable against itself, so the oracle always exists.  Capped,
@@ -162,8 +210,8 @@ def choose_oracle(options: Mapping[str, OptionMeasure], *, at_cap: bool = False,
     """
     create = options[CREATE]
     pool = [o for o in options.values() if feasible(o, at_cap=at_cap)]
-    acceptable = [o for o in pool
-                  if at_least(o.new_score, equivalence * create.new_score) and at_most(o.forgetting, forgetting)]
+    bar = equivalence_bar(create.new_score, equivalence=equivalence, zero_shot=zero_shot)
+    acceptable = [o for o in pool if at_least(o.new_score, bar) and at_most(o.forgetting, forgetting)]
     if acceptable:
         best = min(acceptable, key=lambda o: (o.cost(), -o.new_score, o.key))
         return {"option": best.key, "acceptable": True, "rule": "cheapest acceptable"}
@@ -174,16 +222,17 @@ def choose_oracle(options: Mapping[str, OptionMeasure], *, at_cap: bool = False,
 
 
 def decision_quality(chosen_key: str, options: Mapping[str, OptionMeasure], oracle_key: str, *,
-                     equivalence: float = EQUIVALENCE, forgetting: float = FORGETTING) -> dict[str, Any]:
+                     equivalence: float = EQUIVALENCE, forgetting: float = FORGETTING,
+                     zero_shot: float | None = None) -> dict[str, Any]:
     """Item 7: decision correct, quality shortfall, cost excess, forgetting."""
     chosen, oracle, create = options[chosen_key], options[oracle_key], options[CREATE]
-    acceptable = (at_least(chosen.new_score, equivalence * create.new_score)
-                  and at_most(chosen.forgetting, forgetting))
+    bar = equivalence_bar(create.new_score, equivalence=equivalence, zero_shot=zero_shot)
+    acceptable = at_least(chosen.new_score, bar) and at_most(chosen.forgetting, forgetting)
     correct = chosen_key == oracle_key or (acceptable and chosen.cost() <= oracle.cost())
     return {
         "decision_correct": bool(correct),
         "acceptable": bool(acceptable),
-        "quality_shortfall": max(0.0, equivalence * create.new_score - chosen.new_score),
+        "quality_shortfall": max(0.0, bar - chosen.new_score),
         "cost_excess": {"adapters": chosen.adapters_after - oracle.adapters_after,
                         "training_seconds": chosen.training_seconds - oracle.training_seconds},
         "forgetting": chosen.forgetting,
@@ -237,8 +286,10 @@ def select_fusion_config(table: Mapping[str, Sequence[Mapping[str, float]]], *,
 
 def eligibility(adapter_score: float, zero_shot_score: float, *, threshold: float = ELIGIBILITY) -> dict[str, Any]:
     """Item 25: the dedicated adapter must beat zero-shot by >= 5 % relative on VALIDATION."""
-    if zero_shot_score > 0:
-        gain = (adapter_score - zero_shot_score) / zero_shot_score
+    if zero_shot_score != 0:
+        # |zero-shot|: the same as before for every positive score, and the right direction for a
+        # negative one (rescaled BERTScore, D-027).
+        gain = (adapter_score - zero_shot_score) / abs(zero_shot_score)
         eligible = at_least(gain, threshold)
     else:
         gain = None
@@ -277,7 +328,7 @@ def backbone_suffices(backbone: Mapping[str, float], candidates: Mapping[str, Ma
     best = best_by_probe_score(candidates)
     if best is None:
         return True
-    return at_least(backbone["score"], equivalence * candidates[best]["score"])
+    return at_least(backbone["score"], equivalence_bar(candidates[best]["score"], equivalence=equivalence))
 
 
 def probe_rule(backbone: Mapping[str, float], candidates: Mapping[str, Mapping[str, float]], *,
@@ -286,7 +337,8 @@ def probe_rule(backbone: Mapping[str, float], candidates: Mapping[str, Mapping[s
     best = best_by_probe_score(candidates)
     if best is not None:
         cand = candidates[best]
-        if cand["loss"] < backbone["loss"] and at_least(cand["score"], equivalence * backbone["score"]):
+        if cand["loss"] < backbone["loss"] and at_least(cand["score"], equivalence_bar(backbone["score"],
+                                                                                    equivalence=equivalence)):
             return {"option": f"REUSE:{best}",
                     "reason": f"'{best}' lowers SUPPORT loss vs the backbone and keeps >= "
                               f"{equivalence:.0%} of its probe score"}

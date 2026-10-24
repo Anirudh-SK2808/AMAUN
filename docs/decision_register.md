@@ -712,6 +712,57 @@ Tests: `tests/test_merged_evaluation.py`, `tests/test_bertscore.py`.
 
 ---
 
+## D-027 — ELI5 is judged by gain retention (rescaled BERTScore has no meaningful zero)
+
+**Status:** `RESOLVED` 2026-10-24 (user decision; made before Phase 5 read any ELI5 VALIDATION or
+TEST row)
+
+**Finding.** Rescaled BERTScore-F1 subtracts roberta-large's baseline (F = 0.831), so ordinary
+ELI5 answers score below zero. Measured on the L4 on 16 ELI5 **TRAIN** rows: backbone mean
+−0.106 (14/16 negative), `seed-sum` −0.084 (11/16). Every relative rule of the study is a ratio,
+and ratios are undefined on a scale without a meaningful zero; on negative scores they flip:
+"≥ 0.98 × CREATE" demands beating CREATE, eligibility becomes a sign test, a drop from a
+negative score is always 0. Every other task's primary metric has a true zero (ROUGE, F1,
+accuracy, exact match) and is unaffected.
+
+**Decision.** Metrics in `study_criteria.INTERVAL_SCALE_METRICS` (`bertscore_f1`) are judged by
+**gain retention** over the zero-shot score that the BACKBONE option measures on the same TEST
+examples:
+
+- equivalence bar = zero-shot + 0.98 × (CREATE − zero-shot): an option must keep 98 % of CREATE's
+  gain; the paired CI uses the per-example bar; quality shortfall is measured from the bar;
+- forgetting of ELI5 (Phase 6 stream) = share of the adapter's gain lost (`gain_drop`).
+
+The rule follows from the metric, not from a new config key, so the config hash is unchanged
+and the run resumes. Two comparisons have no CREATE score to anchor a gain and are made
+**sign-safe** instead (identical for every non-negative score): eligibility divides by
+|zero-shot|; the SUPPORT probe comparisons (`probe_rule`, `amaun`'s BACKBONE step) use
+`reference − 2 % × |reference|`. Options considered: sign-safe ratios everywhere (still depends on
+the scale's zero), raw BERTScore or ROUGE-L as primary (config change → full restart; raw is
+compressed, ROUGE-L was non-discriminating in run 1), a fixed metric-unit margin or a
+non-inferiority test (a new threshold to choose). Limitation: ELI5's "within 2 %" is 2 % of a
+gain, not of a score, so it is stricter than for the other tasks; reported as such.
+
+Tests: `tests/test_study_criteria.py` (D-027 block).
+
+---
+
+## D-028 — Phase 4 crash: utility-CV fold split name (run resumed)
+
+**Status:** `RESOLVED` 2026-10-24 (bug fix; no methodology change)
+
+Phase 3 gave 30 pairs, 33 % beneficial — inside the fit gate, so the network was fitted for the
+first time (the dummy tier's supervision is one-class and always fell back). Each leave-one-out
+fold fitted its normaliser under the name `utility_train_minus_<task>`, which the normaliser's
+leakage guard rejects; the run stopped at the start of Phase 4 (2026-10-23 23:12 UTC) with
+Phases 0–3 checkpointed. Each fold now fits under its parent split's name (`utility_train`; the
+held-out task is recorded per fold). Checked by `tests/test_utility_cv.py` (reproduces the crash
+without the fix), a replay of Phase 4 on the run's real Phase 3 measurements, and a dummy study
+with the fit gate forced open (Phases 4–6 with a fitted network). The run resumed with
+`--resume`; the gap is recorded in the checkpoint's `resumes`.
+
+---
+
 ## Summary
 
 | ID | Topic | Status | Blocks |
@@ -742,3 +793,5 @@ Tests: `tests/test_merged_evaluation.py`, `tests/test_bertscore.py`.
 | D-024 | items left out of l4_full_study | **OPEN** (future work) | — |
 | D-025 | training-pool rows repeating a TEST row: dropped from the pool | RESOLVED 2026-10-23 | — |
 | D-026 | merged-weight, batched (4) evaluation; projection fixes | RESOLVED 2026-10-23 | — |
+| D-027 | ELI5 judged by gain retention over zero-shot; sign-safe probes and eligibility | RESOLVED 2026-10-24 | — |
+| D-028 | Phase 4 crash (utility-CV fold split name); run resumed | RESOLVED 2026-10-24 | — |

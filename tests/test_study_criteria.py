@@ -153,3 +153,43 @@ def test_paired_bootstrap_ci():
     assert weighted["mean"] == pytest.approx(0.02) and weighted["contains_zero"] is False
     with pytest.raises(ValueError):
         c.paired_bootstrap_ci([1.0], [1.0, 2.0])
+
+
+# D-027: interval-scale metrics (rescaled BERTScore, mostly negative on ELI5) ------------------
+
+
+def test_equivalence_bar_is_unchanged_for_non_negative_scores():
+    for score in (0.0, 0.05, 0.42, 0.9):
+        assert c.equivalence_bar(score) == pytest.approx(0.98 * score)
+
+
+def test_ratio_bar_would_flip_on_negative_scores_and_gain_retention_does_not():
+    create, zs = -0.05, -0.11                                   # CREATE beats zero-shot by 0.06
+    assert 0.98 * create > create                               # the old bar sat above CREATE itself
+    bar = c.equivalence_bar(create, zero_shot=zs)
+    assert bar == pytest.approx(zs + 0.98 * (create - zs)) and zs < bar < create
+    backbone = O("BACKBONE", zs, {}, adapters_after=6, per_example=[zs] * 20)
+    make = lambda key, score, adapters: O(key, score, {}, adapters_after=adapters, per_example=[score] * 20)
+    options = {"CREATE": make("CREATE", create, 7), "BACKBONE": backbone,
+               "REUSE:a": make("REUSE:a", -0.0511, 6), "REUSE:b": make("REUSE:b", -0.0525, 6)}
+    keeps = c.acceptability(options["REUSE:a"], options["CREATE"], zero_shot=backbone)
+    loses = c.acceptability(options["REUSE:b"], options["CREATE"], zero_shot=backbone)
+    assert keeps["acceptable"] and not loses["acceptable"]
+    assert keeps["gain_retained_vs_create"] == pytest.approx((-0.0511 - zs) / (create - zs))
+    assert c.choose_oracle(options, zero_shot=zs)["option"] == "REUSE:a"
+    quality = c.decision_quality("REUSE:b", options, "REUSE:a", zero_shot=zs)
+    assert quality["quality_shortfall"] == pytest.approx(bar - (-0.0525))
+
+
+def test_eligibility_and_probes_point_the_right_way_on_negative_scores():
+    assert c.eligibility(-0.02, -0.11)["status"] == "eligible"          # a large improvement
+    assert c.eligibility(-0.12, -0.11)["status"] == "non_discriminating"
+    backbone = {"loss": 2.0, "score": -0.10}
+    assert c.probe_rule(backbone, {"a": {"loss": 1.5, "score": -0.0995}})["option"] == "REUSE:a"
+    assert c.probe_rule(backbone, {"a": {"loss": 2.5, "score": -0.0999}})["option"] == "BACKBONE"
+
+
+def test_gain_drop_measures_the_share_of_the_gain_lost():
+    assert c.gain_drop(-0.05, -0.08, -0.11) == pytest.approx(0.5)
+    assert c.gain_drop(-0.05, -0.04, -0.11) == 0.0
+    assert c.relative_drop(0.8, 0.6) == pytest.approx(0.25)            # ratio scale unchanged

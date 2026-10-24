@@ -122,7 +122,10 @@ def fit_with_cv(cfg: ResolvedConfig, supervision: SupervisionSet, *, gate: FitGa
         test = [e for e in examples if e.task_id == held_out]
         if not train:
             continue
-        network, normalizer, _ = _fit(cfg, train, fit_split=f"utility_train_minus_{held_out}")
+        # The fold's rows are a subset of the supervision split, so its statistics are fitted under
+        # that split's name (the normaliser's leakage guard admits only known splits); the held-out
+        # task is recorded in ``folds``.
+        network, normalizer, _ = _fit(cfg, train, fit_split=supervision.fit_split)
         subset = SupervisionSet(examples=test)
         features, targets = subset.tensors(normalizer, cfg.run_mode.value, heads)
         with torch.no_grad():

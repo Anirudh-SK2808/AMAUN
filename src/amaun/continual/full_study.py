@@ -1216,11 +1216,20 @@ class FullStudy(DecisionStudy):
             return {"error": "CREATE was not measured; nothing can be judged", "oracle": {"option": None},
                     "policies": {}}
         create = measures[criteria.CREATE]
+        # D-027: an interval-scale metric (rescaled BERTScore) is judged by gain retention over the
+        # zero-shot score, which the BACKBONE option measures on the same TEST examples.
+        interval = self.tasks[task_id].primary_score in criteria.INTERVAL_SCALE_METRICS
+        zero_shot = measures.get(criteria.BACKBONE) if interval else None
+        if interval and zero_shot is None:
+            return {"error": "BACKBONE was not measured; an interval-scale task cannot be judged",
+                    "oracle": {"option": None}, "policies": {}}
+        zs = None if zero_shot is None else zero_shot.new_score
         oracle = criteria.choose_oracle(measures, at_cap=at_cap, equivalence=self.full.equivalence,
-                                        forgetting=self.full.forgetting)
+                                        forgetting=self.full.forgetting, zero_shot=zs)
         acceptability = {k: {**criteria.acceptability(m, create, equivalence=self.full.equivalence,
                                                       forgetting=self.full.forgetting,
-                                                      resamples=self.full.bootstrap_resamples),
+                                                      resamples=self.full.bootstrap_resamples,
+                                                      zero_shot=zero_shot),
                              "feasible": criteria.feasible(m, at_cap=at_cap)}
                          for k, m in measures.items()}
         # Secondary, run-1 definitions: unweighted mean of the new and every seed task's score.
@@ -1245,14 +1254,15 @@ class FullStudy(DecisionStudy):
                                   "reason": "option not measured"}
                 continue
             quality = criteria.decision_quality(executed, measures, oracle["option"],
-                                                equivalence=self.full.equivalence, forgetting=self.full.forgetting)
+                                                equivalence=self.full.equivalence, forgetting=self.full.forgetting,
+                                                zero_shot=zs)
             ci = None
             if separate_key in measures and executed != separate_key:
                 ci = criteria.paired_bootstrap_ci(measures[executed].per_example, measures[separate_key].per_example,
                                                   resamples=self.full.bootstrap_resamples)
             flags = []
             if not quality["acceptable"]:
-                flags.append("unacceptable: below 0.98 x CREATE or > 1% forgetting")
+                flags.append("unacceptable: below the equivalence bar or > 1% forgetting")
             if quality["cost_excess"]["adapters"] > 0 or quality["cost_excess"]["training_seconds"] > 0:
                 flags.append("costlier than the oracle")
             policies[name] = {
@@ -1264,6 +1274,7 @@ class FullStudy(DecisionStudy):
                 "fallback": decision.get("fallback"),
             }
         return {"at_cap": at_cap, "cap": cap, "oracle": oracle, "acceptability": acceptability,
+                "criteria_scale": "interval: gain retention over zero-shot (D-027)" if zs is not None else "ratio",
                 "average_performance": average, "oracle_option": oracle_by_average,
                 "oracle_option_note": "run-1 definition (best average performance), secondary",
                 "policies": policies}

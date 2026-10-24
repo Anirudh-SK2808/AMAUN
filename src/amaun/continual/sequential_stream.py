@@ -169,7 +169,14 @@ def run_stream(study: Any, *, policy: str, cap: int | None, name: str) -> dict[s
 
     entries = [_materialise(study, item) for item in state["entries"]]
     final = {t: evaluate(t, entries) for t in order}
-    forgetting = {t: criteria.relative_drop(state["arrival"][t], final[t]) for t in order}
+    def forgetting_of(task_id: str) -> float:
+        if study.tasks[task_id].primary_score in criteria.INTERVAL_SCALE_METRICS:      # D-027
+            zero_shot = study._measure(None, task_id, split=SplitName.TEST, n=study._examples("test", task_id),
+                                       label=f"stream:{name}:{task_id}:zero_shot")["primary_score"]
+            return criteria.gain_drop(state["arrival"][task_id], final[task_id], zero_shot)
+        return criteria.relative_drop(state["arrival"][task_id], final[task_id])
+
+    forgetting = {t: forgetting_of(t) for t in order}
     counts: dict[str, int] = {}
     for d in state["decisions"].values():
         outcome = d["executed"].partition(":")[0]
