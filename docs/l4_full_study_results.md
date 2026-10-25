@@ -8,6 +8,10 @@ and checked file by file against a SHA-256 manifest, `results/local_smoke/l4_ful
 evaluation tasks. Every comparison below is descriptive; the confidence intervals resample TEST
 examples only and say nothing about seed-to-seed variation.
 
+**Ablations.** Ablations A1, A3, A6, A7, A8 and A12 were run after this run, against its
+measurements, and are reported separately in `docs/l4_full_study_ablations.md` (D-030). Nothing in
+this document depends on them.
+
 ## 1. Run header
 
 | | |
@@ -497,7 +501,9 @@ fewer.
 - **Data changes.** FinQA TRAIN 5 656 instead of 5 700 (repeated rows, D-021). Training rows that
   repeat a TEST row were dropped (dialog 12, NER 29; D-025).
 - **Left out to fit the budget** (D-024): more seeds; ablations A3 (fixed α) and A8 (global α);
-  300-step fusion; GSM8K; `probe_rule` and the other baselines in the stream.
+  300-step fusion; GSM8K; `probe_rule` and the other baselines in the stream. A3 and A8 were run
+  afterwards, on the six Phase 2 pairs against this run's measurements (D-030;
+  `docs/l4_full_study_ablations.md`); the other items remain future work.
 - **Tests.** The dummy-tier suite (433 tests) passes. Some test files the spec listed were not
   written as such: `test_full_study.py` (R1–R3 against the naive loop, resume), the fusion, data and
   state groups. Their behaviour was exercised by full dummy-tier runs (including a kill-and-resume
