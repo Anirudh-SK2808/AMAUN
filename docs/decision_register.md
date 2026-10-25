@@ -809,6 +809,43 @@ Tests: `tests/test_utility_revision.py`.
 
 ---
 
+## D-030 — Ablations of the finished l4_full_study, against its own measurements
+
+**Status:** `RESOLVED` 2026-10-26 (user decision; recorded before any ablation result was computed)
+
+The ablations declared in `docs/experiment_matrix.md` that the run did not include are run as an
+**add-on analysis**: `configs/experiments/l4_full_study_ablations.yaml`,
+`scripts/run_ablations.py`, `amaun.continual.ablations`. The frozen run
+(`results/local_smoke/l4_full_study`) is only read; outputs go to
+`results/local_smoke/l4_full_study_ablations/`. The run's criteria, D-029 selection rule,
+evaluation path and chosen fusion config (F-c) are inherited unchanged; nothing is re-selected.
+
+- **A1** (semantic features only), **A6** (no historical), **A7** (no resource), **A12**
+  (`token_stats` task representation: `d_task_sq`, `d_task_l2`, `cos_task` recomputed from the
+  SUPPORT rows of the new task and of the candidate's task) are **replayed offline**: the utility
+  model is refitted by the D-029 protocol on the run's 30 Phase 3 pairs with the variant's
+  features, and `amaun` / `amaun_train_first` re-decide each Phase 5 task from the logged gate
+  verdict, SUPPORT probes, prescreen and candidate features, then are scored on the measured TEST
+  options. Expected beforehand: A6 equals the run (its 8 historical features were constant, so the
+  D-029 models already dropped them).
+- **A3** (alpha fixed at its initial 1.0; the fused LoRA still trains) and **A8** (one global alpha
+  per component) are F-c variants measured on the six Phase 2 pairs on VALIDATION, beside the run's
+  F-c and F-e rows.
+- Any FUSE option a variant executes that the run did not measure is measured on TEST with the
+  frozen F-c config, then included.
+
+**Gates.** Two identity checks run first and stop everything on failure: replaying with the run's
+frozen models must reproduce its logged utilities (to 1e-6) and decisions; re-scoring its logged
+decisions with the shared scoring code (`amaun.continual.study_scoring`, factored out of the study
+unchanged) must reproduce its stored tables exactly. Both pass on the run's data (utility
+difference at most 1.2e-7; zero differences in the tables).
+
+**Not covered.** The Phase 6 stream (its decisions depend on live features of a changing
+repository), A5 (the study has no compression mechanism to switch off), more seeds. Results are
+reported in `docs/l4_full_study_ablations.md`, separately from the run's verdicts.
+
+---
+
 ## Summary
 
 | ID | Topic | Status | Blocks |
@@ -842,3 +879,4 @@ Tests: `tests/test_utility_revision.py`.
 | D-027 | ELI5 judged by gain retention over zero-shot; sign-safe probes and eligibility | RESOLVED 2026-10-24 | — |
 | D-028 | Phase 4 crash (utility-CV fold split name); run resumed | RESOLVED 2026-10-24 | — |
 | D-029 | revised utility models (small NN / ridge, nested CV, constant features dropped); `amaun_v0` kept | RESOLVED 2026-10-24 | — |
+| D-030 | ablations A1 / A3 / A6 / A7 / A8 / A12 of the finished run, against its measurements | RESOLVED 2026-10-26 | — |

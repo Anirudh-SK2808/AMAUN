@@ -51,6 +51,7 @@ from amaun.baselines.strategies import (
 )
 from amaun.config import ResolvedConfig, _deep_merge
 from amaun.continual import study_criteria as criteria
+from amaun.continual import study_scoring
 from amaun.continual.data_integrity import load_reference, verify_reference_splits
 from amaun.continual.decision_study import DecisionStudy, _Clock, worst_case_examples
 from amaun.continual.study_state import StudyCheckpoint
@@ -1206,7 +1207,7 @@ class FullStudy(DecisionStudy):
 
     @staticmethod
     def _cap_label(cap: int | None) -> str:
-        return "no_cap" if cap is None else f"cap_{cap}"
+        return study_scoring.cap_label(cap)
 
     def _measure_option(self, task_id: str, key: str, temp: Mapping[str, Any],
                         candidates: Sequence[AdapterEntry]) -> dict[str, Any]:
@@ -1258,78 +1259,15 @@ class FullStudy(DecisionStudy):
     def _score_task(self, task_id: str, decisions: Mapping[str, Mapping[str, Any]],
                     options: Mapping[str, Mapping[str, Any]], candidates: Sequence[AdapterEntry],
                     cap: int | None) -> dict[str, Any]:
-        """Items 6-7 for one task under one cap setting, from the measured options."""
-        at_cap = cap is not None and len(candidates) >= cap
-        measures = {k: criteria.OptionMeasure(
-            key=k, new_score=o["new_task_score"], old_drops=o["old_drops"], adapters_after=o["adapters_after"],
-            training_seconds=o["training_seconds"], stored_bytes=o["stored_bytes"], per_example=o["per_example"])
-            for k, o in options.items()}
-        if criteria.CREATE not in measures:
-            return {"error": "CREATE was not measured; nothing can be judged", "oracle": {"option": None},
-                    "policies": {}}
-        create = measures[criteria.CREATE]
-        # D-027: an interval-scale metric (rescaled BERTScore) is judged by gain retention over the
-        # zero-shot score, which the BACKBONE option measures on the same TEST examples.
-        interval = self.tasks[task_id].primary_score in criteria.INTERVAL_SCALE_METRICS
-        zero_shot = measures.get(criteria.BACKBONE) if interval else None
-        if interval and zero_shot is None:
-            return {"error": "BACKBONE was not measured; an interval-scale task cannot be judged",
-                    "oracle": {"option": None}, "policies": {}}
-        zs = None if zero_shot is None else zero_shot.new_score
-        oracle = criteria.choose_oracle(measures, at_cap=at_cap, equivalence=self.full.equivalence,
-                                        forgetting=self.full.forgetting, zero_shot=zs)
-        acceptability = {k: {**criteria.acceptability(m, create, equivalence=self.full.equivalence,
-                                                      forgetting=self.full.forgetting,
-                                                      resamples=self.full.bootstrap_resamples,
-                                                      zero_shot=zero_shot),
-                             "feasible": criteria.feasible(m, at_cap=at_cap)}
-                         for k, m in measures.items()}
-        # Secondary, run-1 definitions: unweighted mean of the new and every seed task's score.
+        """Items 6-7 for one task under one cap setting (:func:`study_scoring.score_task`)."""
         standalone = {t: self._measure(e.delta, t, split=SplitName.TEST, n=self._examples("test", t),
                                        label=f"standalone:test:{e.adapter_id}")["primary_score"]
                       for e in candidates for t in e.metadata.tasks_served}
-        average = {k: (o["new_task_score"] + sum(o["old_task_scores"].get(t, s) for t, s in standalone.items()))
-                   / (1 + len(standalone)) for k, o in options.items()}
-        feasible_keys = [k for k in options if acceptability[k]["feasible"]]
-        oracle_by_average = max(feasible_keys, key=lambda k: (average[k], -options[k]["adapters_after"]))
-        separate = decisions.get("always_separate", {}).get("option")
-        separate_key = criteria.executed_option(separate, at_cap=at_cap) if separate else None
-        policies = {}
-        for name, decision in decisions.items():
-            chosen = decision.get("option")
-            if chosen is None:
-                policies[name] = {"chosen": None, "measured": False, "reason": decision.get("reason")}
-                continue
-            executed = criteria.executed_option(chosen, at_cap=at_cap)
-            if executed not in measures:
-                policies[name] = {"chosen": chosen, "executed": executed, "measured": False,
-                                  "reason": "option not measured"}
-                continue
-            quality = criteria.decision_quality(executed, measures, oracle["option"],
-                                                equivalence=self.full.equivalence, forgetting=self.full.forgetting,
-                                                zero_shot=zs)
-            ci = None
-            if separate_key in measures and executed != separate_key:
-                ci = criteria.paired_bootstrap_ci(measures[executed].per_example, measures[separate_key].per_example,
-                                                  resamples=self.full.bootstrap_resamples)
-            flags = []
-            if not quality["acceptable"]:
-                flags.append("unacceptable: below the equivalence bar or > 1% forgetting")
-            if quality["cost_excess"]["adapters"] > 0 or quality["cost_excess"]["training_seconds"] > 0:
-                flags.append("costlier than the oracle")
-            policies[name] = {
-                "chosen": chosen, "executed": executed, "infeasible_create_replaced": chosen != executed,
-                "measured": True, **quality, "flags": flags, "ci_vs_always_separate": ci,
-                "new_task_score": measures[executed].new_score,
-                "average_performance": average[executed],
-                "regret_vs_oracle": average[oracle_by_average] - average[executed],
-                "fallback": decision.get("fallback"),
-            }
-        return {"at_cap": at_cap, "cap": cap, "oracle": oracle, "acceptability": acceptability,
-                "criteria_scale": "interval: gain retention over zero-shot (D-027)" if zs is not None else "ratio",
-                "average_performance": average, "oracle_option": oracle_by_average,
-                "oracle_option_note": "run-1 definition (best average performance), secondary",
-                "policies": policies}
+        return study_scoring.score_task(
+            options, decisions, cap=cap, n_candidates=len(candidates),
+            interval=self.tasks[task_id].primary_score in criteria.INTERVAL_SCALE_METRICS, standalone=standalone,
+            equivalence=self.full.equivalence, forgetting=self.full.forgetting,
+            resamples=self.full.bootstrap_resamples)
 
     def phase5_evaluation(self) -> dict[str, Any]:
         results = {}
@@ -1346,49 +1284,13 @@ class FullStudy(DecisionStudy):
         return {"tasks": results, "policy_comparison": comparison}
 
     def _compare_full(self, results: Mapping[str, Any]) -> dict[str, Any]:
-        """Policy tables over the eligible tasks, per cap setting (items 7, 10)."""
+        """Policy tables over the eligible tasks, per cap setting (:func:`study_scoring.compare_policies`)."""
         eligible = [t for t, r in results.items() if r.get("eligibility") == "eligible"]
-        out: dict[str, Any] = {"eligible_tasks": eligible,
-                               "non_discriminating_tasks": [t for t in results if t not in eligible]}
-        for cap in self.full.caps:
-            label = self._cap_label(cap)
-            table = {}
-            for policy in self.full.policies:
-                rows, diffs_a, diffs_b = [], [], []
-                for task_id in eligible:
-                    payload = json.loads((self.tracker.paths.root / "decision_study" /
-                                          f"evaluation_{task_id}.json").read_text())
-                    row = payload["policy_outcomes"][label]["policies"].get(policy) or {}
-                    rows.append((task_id, row))
-                    sep = payload["policy_outcomes"][label]["policies"].get("always_separate") or {}
-                    if row.get("measured") and sep.get("measured"):
-                        diffs_a += payload["options"][row["executed"]]["per_example"]
-                        diffs_b += payload["options"][sep["executed"]]["per_example"]
-                measured = [r for _, r in rows if r.get("measured")]
-
-                def mean(values):
-                    values = list(values)
-                    return sum(values) / len(values) if values else None
-                table[policy] = {
-                    "decisions": {t: r.get("executed", r.get("chosen")) for t, r in rows},
-                    "n_measured": len(measured),
-                    "decision_correct": mean(1.0 if r["decision_correct"] else 0.0 for r in measured),
-                    "acceptable": mean(1.0 if r["acceptable"] else 0.0 for r in measured),
-                    "mean_quality_shortfall": mean(r["quality_shortfall"] for r in measured),
-                    "mean_cost_excess_adapters": mean(r["cost_excess"]["adapters"] for r in measured),
-                    "mean_cost_excess_training_seconds": mean(r["cost_excess"]["training_seconds"] for r in measured),
-                    "mean_forgetting": mean(r["forgetting"] for r in measured),
-                    "max_forgetting": max((r["forgetting"] for r in measured), default=None),
-                    "mean_average_performance": mean(r["average_performance"] for r in measured),
-                    "mean_regret_vs_oracle": mean(r["regret_vs_oracle"] for r in measured),
-                    "pooled_ci_vs_always_separate": (criteria.paired_bootstrap_ci(
-                        diffs_a, diffs_b, resamples=self.full.bootstrap_resamples)
-                        if diffs_a and policy != "always_separate" else None),
-                }
-            out[label] = table
-        out["caveat"] = ("one seed: CIs resample TEST examples only; scores pooled across tasks mix metrics "
-                         "and are descriptive")
-        return out
+        payloads = {t: json.loads((self.tracker.paths.root / "decision_study" / f"evaluation_{t}.json").read_text())
+                    for t in eligible}
+        return study_scoring.compare_policies(
+            payloads, eligible=eligible, non_discriminating=[t for t in results if t not in eligible],
+            policies=self.full.policies, caps=self.full.caps, resamples=self.full.bootstrap_resamples)
 
     # -- phase 6: sequential stream -----------------------------------------------
     def phase6_stream(self) -> dict[str, Any]:

@@ -1,0 +1,37 @@
+# Ablations of the finished l4_full_study (D-030), scored against that run's own measurements.
+#
+#   .venv/bin/python scripts/run_ablations.py --config configs/experiments/l4_full_study_ablations.yaml \
+#       --run-mode local_smoke --part 1        # feature ablations, offline (CPU; needs the data splits)
+#   ... --part 2 [--resume]                     # A3 / A8 on the fusion pairs + unmeasured FUSE choices (GPU)
+#
+# Everything the run measured, configured and froze is inherited unchanged (same criteria, same
+# D-029 selection rule, same evaluation path); the frozen run under `ablations.frozen_run` is read,
+# never written.  Outputs go to results/<run_mode>/l4_full_study_ablations/.
+includes:
+  - experiments/l4_full_study.yaml
+
+experiment_id: l4_full_study_ablations
+
+ablations:
+  frozen_run: results/local_smoke/l4_full_study
+  frozen_adapters: adapters/local_smoke/l4_full_study
+  # Utility-model feature ablations (docs/experiment_matrix.md), each refitted with the D-029
+  # protocol on the run's 30 Phase 3 pairs and replayed on Phase 5's logged decision inputs.
+  feature_variants:
+    A1: {keep_families: [semantic]}             # semantic features only
+    A6: {drop_families: [historical]}           # no historical features
+    A7: {drop_families: [resource]}             # no resource features
+    A12: {task_representation: token_stats}     # task representation = support-set word statistics
+  # Fusion ablations of the run's chosen config, on the Phase 2 pairs (VALIDATION).
+  fusion_base: F-c
+  fusion_variants:
+    - name: A3                                  # fixed alpha (stays at init 1.0); the fused LoRA still trains
+      fusion: {coefficient: {learning_rate: 0.0}}
+    - name: A8                                  # one alpha per component instead of one per layer
+      fusion: {coefficient: {granularity: global}}
+
+run_mode_overrides:
+  dummy:
+    ablations:
+      frozen_run: results/dummy/l4_full_study
+      frozen_adapters: adapters/dummy/l4_full_study
